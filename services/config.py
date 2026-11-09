@@ -75,13 +75,6 @@ DEFAULT_PROXY_RUNTIME = {
     },
 }
 
-DEFAULT_THIRD_PARTY_APPS = {
-    "infinite_canvas": {
-        "enabled": False,
-        "url": "https://canvas.best",
-    },
-}
-
 DEFAULT_IMAGE_MODELS = [
     "gpt-image-2.6-sunburst",
     "gpt-image-2.6-flare",
@@ -314,17 +307,6 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
                 clearance_source.get("warm_up_on_start"),
                 bool(default_clearance["warm_up_on_start"]),
             ),
-        },
-    }
-
-
-def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    canvas_source = source.get("infinite_canvas") if isinstance(source.get("infinite_canvas"), dict) else {}
-    return {
-        "infinite_canvas": {
-            "enabled": _normalize_bool(canvas_source.get("enabled"), False),
-            "url": str(canvas_source.get("url") or DEFAULT_THIRD_PARTY_APPS["infinite_canvas"]["url"]).strip(),
         },
     }
 
@@ -680,7 +662,7 @@ class ConfigStore:
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
-        data["third_party_apps"] = self.get_third_party_apps_settings()
+        data.pop("third_party_apps", None)
         data.pop("auth-key", None)
         return data
 
@@ -702,13 +684,11 @@ class ConfigStore:
             clearance["has_cf_clearance"] = bool(cf_clearance)
         return runtime
 
-    def get_third_party_apps_settings(self) -> dict[str, object]:
-        return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
-
     def update(self, data: dict[str, object]) -> dict[str, object]:
         incoming = dict(data or {})
         next_data = dict(self.data)
         next_data.update(incoming)
+        next_data.pop("third_party_apps", None)
         if "image_models_cache" in incoming:
             next_data["image_models_cache"] = _normalize_image_model_list(next_data.get("image_models_cache"))
         if "custom_image_models" in next_data:
@@ -731,8 +711,6 @@ class ConfigStore:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
             )
-        if "third_party_apps" in next_data:
-            next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):

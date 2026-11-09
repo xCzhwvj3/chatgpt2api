@@ -97,7 +97,7 @@ services:
       flaresolverr:
         condition: service_started
     ports:
-      - "${CHATGPT2API_PORT:-3000}:80"
+      - "127.0.0.1:${CHATGPT2API_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
@@ -106,3 +106,11 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+    networks:
+      - default
+      - sub2api
+
+networks:
+  sub2api:
+    external: true
+    name: sub2api_sub2api-network

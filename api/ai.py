@@ -5,7 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import parse_chat_completion_files_request, parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.config import config
@@ -133,6 +133,26 @@ def create_router() -> APIRouter:
             "文本生成",
             request_text=request_preview,
             request_shape=request_shape(payload.get("messages")),
+        )
+        await filter_or_log(call, request_preview)
+        return await call.run(openai_v1_chat_complete.handle, payload)
+
+    @router.post("/v1/chat/completions/files")
+    async def create_chat_completion_files(
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        payload = await parse_chat_completion_files_request(request)
+        model = str(payload["model"])
+        request_preview = request_text(payload["prompt"], payload["messages"])
+        call = LoggedCall(
+            identity,
+            "/v1/chat/completions/files",
+            model,
+            "文件识图",
+            request_text=request_preview,
+            request_shape=request_shape(payload["messages"]),
         )
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)

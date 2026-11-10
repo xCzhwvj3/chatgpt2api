@@ -308,3 +308,48 @@ async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
     if not images:
         raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
     return images
+
+
+async def parse_chat_completion_files_request(request: Request) -> dict[str, Any]:
+    """解析识图接口的 multipart 请求：把重复 files 转成消息里的图片字节。"""
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "multipart/form-data":
+        raise HTTPException(status_code=415, detail={"error": "Content-Type must be multipart/form-data"})
+
+    form = await request.form()
+    prompt = _clean(form.get("prompt"))
+    if not prompt:
+        raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+
+    model = _clean(form.get("model"), "auto")
+    stream = _parse_bool(form.get("stream"))
+    image_parts: list[dict[str, Any]] = []
+    for key, value in form.multi_items():
+        if key not in {"files", "files[]"} or not _is_upload(value):
+            continue
+        try:
+            image_data = await value.read()
+        finally:
+            await value.close()
+        if not image_data:
+            raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+        if len(image_data) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image file exceeds 50MB limit"})
+        mime_type = _clean(value.content_type)
+        if not mime_type or mime_type in {"application/octet-stream", "binary/octet-stream"}:
+            mime_type = mimetypes.guess_type(value.filename or "")[0] or "image/png"
+        if not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail={"error": "files must be image files"})
+        image_parts.append({"type": "image", "data": image_data, "mime": mime_type})
+
+    if not image_parts:
+        raise HTTPException(status_code=400, detail={"error": "at least one files item is required"})
+    return {
+        "model": model,
+        "prompt": prompt,
+        "stream": bool(stream),
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}, *image_parts],
+        }],
+    }

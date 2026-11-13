@@ -795,11 +795,17 @@ def is_image_tool_event(event: dict[str, Any]) -> bool:
 def _is_user_message_event(event: dict[str, Any]) -> bool:
     """检查事件是否来自 user 角色消息。"""
     value = event.get("v")
-    message = event.get("message") or (value.get("message") if isinstance(value, dict) else None)
-    if isinstance(message, dict):
-        author = message.get("author") or {}
-        if str(author.get("role") or "").strip().lower() == "user":
-            return True
+    containers = [event]
+    if isinstance(value, dict):
+        containers.append(value)
+    for container in containers:
+        for key in ("message", "input_message"):
+            message = container.get(key)
+            if not isinstance(message, dict):
+                continue
+            author = message.get("author") or {}
+            if str(author.get("role") or "").strip().lower() == "user":
+                return True
     return False
 
 

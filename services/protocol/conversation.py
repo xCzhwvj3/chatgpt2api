@@ -22,16 +22,22 @@ from services.openai_backend_api import (
     TEXT_STREAM_TIMEOUT_SECS,
 )
 from utils.helper import (
+    UPLOAD_LIMIT_MESSAGE,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
+    is_upload_limit_error,
     split_image_model,
     supported_image_models,
     UpstreamHTTPError,
+    upstream_error_body_text,
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 from utils.ui_markup import strip_ui_markup
+
+
+TEXT_UPLOAD_LIMIT_MAX_RETRIES = 2
 
 
 class ImageGenerationError(Exception):
@@ -129,12 +135,9 @@ def is_image_concurrency_error(error: BaseException) -> bool:
     """识别文件服务返回的账号级并发限流错误。"""
     if not isinstance(error, UpstreamHTTPError) or error.status_code not in {429, 503}:
         return False
-    body = error.body
-    try:
-        body_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
-    except (TypeError, ValueError):
-        body_text = repr(body)
-    text = body_text.lower()
+    if is_upload_limit_error(error):
+        return False
+    text = upstream_error_body_text(error).lower()
     return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
 
 
@@ -1008,6 +1011,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    upload_limit_retries = 0
     started_at = time.monotonic()
     last_delta_at = 0.0
     delta_count = 0
@@ -1046,6 +1050,18 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 account_service.mark_text_used(token)
                 return
             except Exception as exc:
+                if token and not emitted and is_upload_limit_error(exc):
+                    upload_limit_retries += 1
+                    if upload_limit_retries <= TEXT_UPLOAD_LIMIT_MAX_RETRIES:
+                        next_token = account_service.get_text_access_token(attempted_tokens)
+                        if next_token:
+                            logger.warning({
+                                "event": "text_upload_limit_account_retry",
+                                "attempt": upload_limit_retries,
+                            })
+                            token = next_token
+                            continue
+                    raise
                 error_message = str(exc)
                 if token and not emitted and is_token_invalid_error(error_message):
                     refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
@@ -1625,12 +1641,15 @@ def _generate_single_image(
     MAX_POLL_TIMEOUT_RETRIES = 4
     # 文件服务并发限流最大重试次数（换账号重试）
     MAX_CONCURRENCY_RETRIES = 3
+    # 文件上传配额耗尽最大换号次数（不原地等待）
+    MAX_UPLOAD_LIMIT_RETRIES = 3
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     concurrency_retry_count = 0
+    upload_limit_retry_count = 0
     account_email = ""
     request_deadline = time.monotonic() + float(config.image_poll_timeout_secs)
 
@@ -1795,8 +1814,10 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
+            upload_limited = is_upload_limit_error(exc)
             cooldown_secs = float(config.image_timeout_retry_secs) if (
-                isinstance(exc, ImageStreamHardTimeoutError) or is_image_concurrency_error(exc)
+                isinstance(exc, ImageStreamHardTimeoutError)
+                or (not upload_limited and is_image_concurrency_error(exc))
             ) else 0.0
             account_service.mark_image_result(token, False, cooldown_secs=cooldown_secs)
             last_error = str(exc)
@@ -1807,6 +1828,23 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token and upload_limited:
+                upload_limit_retry_count += 1
+                if upload_limit_retry_count <= MAX_UPLOAD_LIMIT_RETRIES and request_deadline > time.monotonic():
+                    logger.warning({
+                        "event": "image_upload_limit_account_retry",
+                        "account_email": account_email,
+                        "retry_count": upload_limit_retry_count,
+                        "index": index,
+                    })
+                    continue
+                raise ImageGenerationError(
+                    UPLOAD_LIMIT_MESSAGE,
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    code="upload_limit_exceeded",
+                    account_email=account_email,
+                ) from exc
             if not emitted_for_token and is_image_concurrency_error(exc):
                 concurrency_retry_count += 1
                 if concurrency_retry_count <= MAX_CONCURRENCY_RETRIES and request_deadline > time.monotonic():
@@ -1946,6 +1984,12 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     "failed_index": index,
                     "error": str(errors[index])[:200],
                 })
+
+    if not emitted and errors and all(
+        isinstance(error, ImageGenerationError) and error.code == "upload_limit_exceeded"
+        for error in errors.values()
+    ):
+        raise errors[min(errors)]
 
     if not emitted:
         if not last_error:

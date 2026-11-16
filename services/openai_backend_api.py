@@ -24,7 +24,15 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    UpstreamHTTPError,
+    ensure_ok,
+    is_upload_limit_error,
+    iter_sse_payloads,
+    new_uuid,
+    split_image_model,
+    upstream_error_body_text,
+)
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -273,12 +281,9 @@ class OpenAIBackendAPI:
         """判断文件服务是否因账号并发限制暂时拒绝请求。"""
         if error.status_code not in {429, 503}:
             return False
-        body = error.body
-        try:
-            body_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
-        except (TypeError, ValueError):
-            body_text = repr(body)
-        text = body_text.lower()
+        if is_upload_limit_error(error):
+            return False
+        text = upstream_error_body_text(error).lower()
         return "concurrency_limit" in text or "too many concurrent" in text or "throttled" in text
 
     def _post_image_file_request(self, path: str, **kwargs: Any) -> requests.Response:

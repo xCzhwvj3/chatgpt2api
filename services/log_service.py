@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
 from services.protocol.error_response import anthropic_error_response, openai_error_response
-from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.helper import UPLOAD_LIMIT_MESSAGE, anthropic_sse_stream, is_upload_limit_error, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
@@ -182,6 +182,13 @@ def _request_excerpt(text: object, limit: int = 1000) -> str:
 def _image_error_response(exc: Exception) -> JSONResponse:
     from services.protocol.conversation import public_image_error_message
 
+    if is_upload_limit_error(exc):
+        return openai_error_response(
+            UPLOAD_LIMIT_MESSAGE,
+            429,
+            error_type="rate_limit_error",
+            code="upload_limit_exceeded",
+        )
     message = public_image_error_message(str(exc))
     if "no available image quota" in message.lower():
         return openai_error_response(
@@ -201,6 +208,15 @@ def _image_error_response(exc: Exception) -> JSONResponse:
 
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
+    if is_upload_limit_error(exc):
+        if sse == "anthropic":
+            return anthropic_error_response(UPLOAD_LIMIT_MESSAGE, 429)
+        return openai_error_response(
+            UPLOAD_LIMIT_MESSAGE,
+            429,
+            error_type="rate_limit_error",
+            code="upload_limit_exceeded",
+        )
     message = str(exc)
     if sse == "anthropic":
         return anthropic_error_response(message, status_code)

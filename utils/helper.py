@@ -166,6 +166,8 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
 
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
+UPLOAD_LIMIT_REASON = "upload_protection_limit_exceeded"
+UPLOAD_LIMIT_MESSAGE = "File upload limit exceeded for all available accounts. Please retry after the limit resets."
 
 
 class UpstreamHTTPError(RuntimeError):
@@ -215,6 +217,26 @@ def ensure_ok(response: requests.Response, context: str) -> None:
         if ra_str.isdigit():
             retry_after = int(ra_str)
     raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
+
+
+def upstream_error_body_text(error: UpstreamHTTPError) -> str:
+    body = error.body
+    try:
+        return json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+    except (TypeError, ValueError):
+        return repr(body)
+
+
+def is_upload_limit_error(error: BaseException) -> bool:
+    """识别账号级文件上传配额耗尽；它与并发限流不同，原地重试不会恢复。"""
+    if not isinstance(error, UpstreamHTTPError) or error.status_code != 429:
+        return False
+    text = upstream_error_body_text(error).lower()
+    return (
+        UPLOAD_LIMIT_REASON in text
+        or "file upload limit" in text
+        or "文件上传上限" in text
+    )
 
 
 def sse_json_stream(items) -> Iterator[str]:

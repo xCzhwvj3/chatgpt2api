@@ -57,6 +57,7 @@ class AccountService:
         self._image_cooldown_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
+        self._last_alert_counts = self._count_total_and_active_locked()
 
     def _get_cumulative_file(self) -> Path:
         from services.config import DATA_DIR
@@ -128,6 +129,73 @@ class AccountService:
 
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
+        self._check_account_alert_locked()
+
+    def _count_total_and_active_locked(self) -> tuple[int, int]:
+        total = len(self._accounts)
+        active = sum(1 for item in self._accounts.values() if item.get("status") == "正常")
+        return total, active
+
+    def _check_account_alert_locked(self) -> None:
+        current_counts = self._count_total_and_active_locked()
+        if current_counts == self._last_alert_counts:
+            return
+        self._last_alert_counts = current_counts
+
+        alert_cfg = config.get_account_alert_settings()
+        if not alert_cfg.get("enabled"):
+            return
+        webhook_url = str(alert_cfg.get("webhook_url") or "").strip()
+        if not webhook_url:
+            return
+
+        total, active = current_counts
+        min_total = int(alert_cfg.get("min_total") or 0)
+        min_active = int(alert_cfg.get("min_active") or 0)
+        if total >= min_total and active >= min_active:
+            return
+
+        # 在后台线程发送告警，避免持有账号锁时发生网络阻塞
+        Thread(
+            target=self._send_account_alert,
+            args=(total, active, alert_cfg),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _send_account_alert(total: int, active: int, alert_cfg: dict[str, object]) -> None:
+        from curl_cffi import requests
+
+        webhook_url = str(alert_cfg.get("webhook_url") or "").strip()
+        api_key = str(alert_cfg.get("api_key") or "").strip()
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["x-api-key"] = api_key
+        payload = {
+            "title": str(alert_cfg.get("title") or "chat2api 告警"),
+            "template": str(alert_cfg.get("template") or "orange"),
+            "message": str(alert_cfg.get("message") or "账号/正常账号已低于警戒值，尽快补充账号"),
+        }
+        try:
+            resp = requests.post(webhook_url, headers=headers, json=payload, timeout=10)
+            if resp.status_code >= 400:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "账号告警通知发送失败",
+                    {"status_code": resp.status_code, "total": total, "active": active},
+                )
+                return
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "已发送账号低水位告警通知",
+                {"total": total, "active": active},
+            )
+        except Exception as exc:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "账号告警通知异常",
+                {"error": str(exc), "total": total, "active": active},
+            )
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:

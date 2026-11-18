@@ -48,6 +48,17 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "drop_assistant_history": False,
 }
 
+DEFAULT_ACCOUNT_ALERT = {
+    "enabled": False,
+    "webhook_url": "",
+    "api_key": "",
+    "min_total": 40,
+    "min_active": 20,
+    "title": "chat2api 告警",
+    "template": "orange",
+    "message": "账号/正常账号已低于警戒值，尽快补充账号",
+}
+
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -230,6 +241,34 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
             source.get("drop_assistant_history"),
             bool(DEFAULT_CHAT_COMPLETION_CACHE["drop_assistant_history"]),
         ),
+    }
+
+
+def _normalize_account_alert_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    api_key = str(source.get("api_key") or "").strip()
+    if not api_key:
+        api_key = str(source.get("_existing_api_key") or "").strip()
+    return {
+        "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_ACCOUNT_ALERT["enabled"])),
+        "webhook_url": str(source.get("webhook_url") or DEFAULT_ACCOUNT_ALERT["webhook_url"]).strip(),
+        "api_key": api_key,
+        "min_total": _normalize_positive_int(
+            source.get("min_total"),
+            int(DEFAULT_ACCOUNT_ALERT["min_total"]),
+            minimum=0,
+        ),
+        "min_active": _normalize_positive_int(
+            source.get("min_active"),
+            int(DEFAULT_ACCOUNT_ALERT["min_active"]),
+            minimum=0,
+        ),
+        "title": str(source.get("title") or DEFAULT_ACCOUNT_ALERT["title"]).strip()
+        or str(DEFAULT_ACCOUNT_ALERT["title"]),
+        "template": str(source.get("template") or DEFAULT_ACCOUNT_ALERT["template"]).strip()
+        or str(DEFAULT_ACCOUNT_ALERT["template"]),
+        "message": str(source.get("message") or DEFAULT_ACCOUNT_ALERT["message"]).strip()
+        or str(DEFAULT_ACCOUNT_ALERT["message"]),
     }
 
 
@@ -662,6 +701,7 @@ class ConfigStore:
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
+        data["account_alert"] = self.get_public_account_alert_settings()
         data.pop("third_party_apps", None)
         data.pop("auth-key", None)
         return data
@@ -711,6 +751,13 @@ class ConfigStore:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
             )
+        if "account_alert" in next_data:
+            incoming_alert = next_data.get("account_alert")
+            if isinstance(incoming_alert, dict):
+                previous_alert = self.get_account_alert_settings()
+                incoming_alert = dict(incoming_alert)
+                incoming_alert["_existing_api_key"] = previous_alert.get("api_key")
+            next_data["account_alert"] = _normalize_account_alert_settings(incoming_alert)
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):
@@ -733,6 +780,26 @@ class ConfigStore:
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
+
+    def get_account_alert_settings(self) -> dict[str, object]:
+        settings = _normalize_account_alert_settings(self.data.get("account_alert"))
+        env_enabled = os.getenv("ACCOUNT_ALERT_ENABLED")
+        if env_enabled is not None and env_enabled != "":
+            settings["enabled"] = _normalize_bool(env_enabled, bool(settings["enabled"]))
+        env_url = str(os.getenv("ACCOUNT_ALERT_WEBHOOK_URL") or "").strip()
+        if env_url:
+            settings["webhook_url"] = env_url
+        env_api_key = str(os.getenv("ACCOUNT_ALERT_API_KEY") or "").strip()
+        if env_api_key:
+            settings["api_key"] = env_api_key
+        return settings
+
+    def get_public_account_alert_settings(self) -> dict[str, object]:
+        settings = dict(self.get_account_alert_settings())
+        api_key = str(settings.get("api_key") or "").strip()
+        settings["api_key"] = ""
+        settings["has_api_key"] = bool(api_key)
+        return settings
 
     def get_storage_backend(self) -> StorageBackend:
         """获取存储后端实例（单例）"""

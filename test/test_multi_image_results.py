@@ -72,13 +72,17 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
-    def test_image_model_slug_uses_thinking_slug_for_standard_image_model(self) -> None:
+    def test_image_model_slug_maps_legacy_models_to_upstream_models(self) -> None:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
 
-        self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-5-thinking")
-        self.assertEqual(backend._image_model_slug("gpt-5-5-thinking"), "gpt-5-5-thinking")
-        self.assertEqual(backend._image_model_slug("gpt-5-5"), "gpt-5-5")
-        self.assertEqual(backend._image_model_slug("gpt-5-3"), "gpt-5-3")
+        self.assertEqual(backend._image_model_slug("gpt-image-2"), "auto")
+        self.assertEqual(backend._image_model_slug("gpt-image-2.5-flare"), "gpt-image-2.6-flare")
+        self.assertEqual(backend._image_model_slug("gpt-image-2.5-sunburst"), "gpt-image-2.6-sunburst")
+        self.assertEqual(backend._image_model_slug("gpt-image-2.6-flare"), "gpt-image-2.6-flare")
+        self.assertEqual(backend._image_model_slug("gpt-6"), "gpt-6")
+        self.assertEqual(backend._image_model_slug("gpt-5-5-thinking"), "gpt-6")
+        self.assertEqual(backend._image_model_slug("gpt-5-5"), "gpt-6")
+        self.assertEqual(backend._image_model_slug("gpt-5-3"), "gpt-6")
         self.assertEqual(backend._image_model_slug("codex-gpt-image-2"), "codex-gpt-image-2")
         self.assertEqual(backend._image_model_slug("unknown-image-model"), "auto")
 

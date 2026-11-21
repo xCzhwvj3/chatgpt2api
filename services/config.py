@@ -92,6 +92,7 @@ DEFAULT_IMAGE_MODELS = [
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",
+    "gpt-6",
     "gpt-5-5-thinking",
     "gpt-5-5",
     "gpt-5-3",

@@ -1002,6 +1002,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: float | None = None,
     ) -> str:
         with self._image_slot_condition:
             while True:
@@ -1016,7 +1017,13 @@ class AccountService:
                     self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
-                self._image_slot_condition.wait(timeout=1.0)
+                wait_secs = 1.0
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("等待可用生图账号超时（号池内账号均处于并发占用或冷却中）")
+                    wait_secs = min(1.0, remaining)
+                self._image_slot_condition.wait(timeout=wait_secs)
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
@@ -1035,6 +1042,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: float | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1044,11 +1052,14 @@ class AccountService:
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
         for _attempt in range(max_attempts):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RuntimeError("等待可用生图账号超时（已超出本次生图超时预算）")
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
                 plan_type=plan_type,
                 source_type=source_type,
                 plan_types=plan_types,
+                deadline=deadline,
             )
             attempted_tokens.add(access_token)
             try:
@@ -1089,6 +1100,26 @@ class AccountService:
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+
+    def get_access_token_by_email(self, email: str) -> str:
+        """按邮箱查找原账号可用 token，供续轮询查询其所属 conversation_id。"""
+        target = str(email or "").strip().lower()
+        if not target:
+            return ""
+        matched_token = ""
+        with self._lock:
+            for account in self._accounts.values():
+                if str(account.get("email") or "").strip().lower() != target:
+                    continue
+                if account.get("status") in {"禁用", "异常"}:
+                    continue
+                token = str(account.get("access_token") or "").strip()
+                if token:
+                    matched_token = token
+                    break
+        if not matched_token:
+            return ""
+        return self.refresh_access_token(matched_token, event="get_access_token_by_email") or matched_token
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:

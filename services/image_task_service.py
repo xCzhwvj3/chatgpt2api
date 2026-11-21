@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -221,6 +222,7 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), config.default_image_model),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "base_url": _clean(payload.get("base_url")),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -291,9 +293,19 @@ class ImageTaskService:
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
-                              duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+            extra_fields: dict[str, Any] = {}
+            if conversation_id:
+                extra_fields["conversation_id"] = conversation_id
+            if account_email:
+                extra_fields["account_email"] = account_email
+            self._update_task(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                data=[],
+                duration_ms=duration_ms,
+                **extra_fields,
+            )
             self._log_call(
                 identity,
                 mode,
@@ -401,6 +413,15 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            conversation_id = _clean(item.get("conversation_id"))
+            if conversation_id:
+                task["conversation_id"] = conversation_id
+            account_email = _clean(item.get("account_email"))
+            if account_email:
+                task["account_email"] = account_email
+            base_url = _clean(item.get("base_url"))
+            if base_url:
+                task["base_url"] = base_url
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
@@ -440,6 +461,7 @@ class ImageTaskService:
         identity: dict[str, object],
         task_id: str,
         extra_timeout_secs: float = 30.0,
+        base_url: str = "",
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
@@ -451,20 +473,28 @@ class ImageTaskService:
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
             error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
+            if "超时" not in error_msg and "硬上限" not in error_msg and "timeout" not in error_msg.lower():
                 raise ValueError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
             model = task.get("model", config.default_image_model)
+            account_email = _clean(task.get("account_email"))
+            resolved_base_url = _clean(base_url) or _clean(task.get("base_url"))
             # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            self._update_task(
+                key,
+                status=TASK_STATUS_RUNNING,
+                error="",
+                started_ts=time.time(),
+                **({"base_url": resolved_base_url} if resolved_base_url else {}),
+            )
 
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, account_email, resolved_base_url),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -479,15 +509,27 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        account_email: str = "",
+        base_url: str = "",
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
         try:
+            from services.account_service import account_service
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            # 优先复用产生该 conversation_id 的原账号，避免跨账号查询 404/401
+            access_token = (
+                account_service.get_access_token_by_email(account_email)
+                if account_email else ""
+            ) or account_service.get_text_access_token()
+            if not access_token:
+                raise RuntimeError("号池中没有可用于继续等待的登录账号")
+
+            backend = OpenAIBackendAPI(access_token=access_token)
+            backend.image_request_deadline = time.monotonic() + float(extra_timeout_secs)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -497,6 +539,8 @@ class ImageTaskService:
                     f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
                 )
 
+            # 已拿到图片资产时预留短下载窗口，避免刚轮询结束立即因 deadline 过期导致下载失败
+            backend.image_request_deadline = max(backend.image_request_deadline, time.monotonic() + 15.0)
             image_urls = backend.resolve_conversation_image_urls(
                 conversation_id, file_ids, sediment_ids, poll=False,
             )
@@ -504,21 +548,18 @@ class ImageTaskService:
                 raise RuntimeError("图片 URL 解析失败")
 
             image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                {"b64_json": base64.b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
             data = format_image_result(
                 image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
                 "",
+                "url",
+                base_url or None,
                 int(time.time()),
             )["data"]
+            if not data:
+                raise RuntimeError("图片下载成功但未生成可访问结果")
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,
@@ -528,11 +569,20 @@ class ImageTaskService:
                 "调用完成（续轮询）",
                 status="success",
                 urls=_collect_image_urls(data),
+                account_email=account_email,
             )
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
+            self._update_task(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                data=[],
+                duration_ms=duration_ms,
+                conversation_id=conversation_id,
+                **({"account_email": account_email} if account_email else {}),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -541,6 +591,7 @@ class ImageTaskService:
                 "调用失败（续轮询）",
                 status="failed",
                 error=error_message,
+                account_email=account_email,
             )
         finally:
             if backend is not None:

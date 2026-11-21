@@ -23,6 +23,7 @@ DEFAULT_WEB_IMAGE_MODELS = {
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",
+    "gpt-6",
     "gpt-5-5-thinking",
     "gpt-5-5",
     "gpt-5-3",
@@ -294,7 +295,18 @@ def _iter_sse_chunks(response: requests.Response, deadline: float | None, timeou
 
     stream_queue = getattr(response, "queue", None)
     if stream_queue is None:
-        yield from response.iter_content()
+        # 当响应对象未暴露底层 queue 时，按块检查 deadline 兜底防止无上限阻塞
+        if time.monotonic() >= deadline:
+            _detach_stream_response(response)
+            raise TimeoutError(timeout_message)
+        for chunk in response.iter_content():
+            if time.monotonic() >= deadline:
+                _detach_stream_response(response)
+                raise TimeoutError(timeout_message)
+            yield chunk
+        if time.monotonic() >= deadline:
+            _detach_stream_response(response)
+            raise TimeoutError(timeout_message)
         return
 
     while True:

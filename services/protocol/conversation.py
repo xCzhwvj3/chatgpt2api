@@ -381,6 +381,7 @@ class ConversationState:
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    tool_name: str = ""
 
 
 @dataclass
@@ -782,7 +783,12 @@ def is_image_tool_event(event: dict[str, Any]) -> bool:
     content = message.get("content") or {}
     if author.get("role") != "tool":
         return False
-    if metadata.get("async_task_type") == "image_gen":
+    # 新版上游生图工具消息使用工具名 t2uay3k.sj1i4kz 或 image_gen_title 标识，不再返回 async_task_type
+    if (
+        metadata.get("async_task_type") == "image_gen"
+        or author.get("name") == "t2uay3k.sj1i4kz"
+        or bool(metadata.get("image_gen_title"))
+    ):
         return True
     if content.get("content_type") != "multimodal_text":
         return False
@@ -828,7 +834,11 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
     image_context = (
         (isinstance(event, dict) and is_image_tool_event(event))
         or (state.tool_invoked is True and not is_user_msg)
-        or (is_patch_event and not is_user_msg and ("asset_pointer" in payload or "file-service://" in payload))
+        or (
+            is_patch_event
+            and not is_user_msg
+            and ("asset_pointer" in payload or "file-service://" in payload or "sediment://" in payload)
+        )
     )
     if image_context:
         add_unique(state.file_ids, file_ids)
@@ -849,6 +859,7 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
             if isinstance(metadata.get("tool_invoked"), bool):
                 state.tool_invoked = metadata["tool_invoked"]
             state.turn_use_case = str(metadata.get("turn_use_case") or state.turn_use_case)
+            state.tool_name = str(metadata.get("tool_name") or state.tool_name)
 
 
 def conversation_base_event(event_type: str, state: ConversationState, **extra: Any) -> dict[str, Any]:
@@ -861,6 +872,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "blocked": state.blocked,
         "tool_invoked": state.tool_invoked,
         "turn_use_case": state.turn_use_case,
+        "tool_name": state.tool_name,
         **extra,
     }
 
@@ -892,6 +904,10 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
         update_conversation_state(state, payload, event)
+        # 上游发送 message_stream_complete 时本轮输出已完成，立即结束避免后续空等连接断开
+        if event.get("type") == "message_stream_complete":
+            yield conversation_base_event("conversation.done", state, done=True)
+            break
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
             streams.clear()
@@ -973,6 +989,28 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             # 上游已经把这条（或这些）消息标记为完成，不必再等它关连接。
             yield conversation_base_event("conversation.done", state, done=True)
             break
+        if not stop_on_finish and (state.file_ids or state.sediment_ids):
+            has_end_turn = (
+                any(
+                    isinstance(candidate, dict)
+                    and isinstance(candidate.get("message"), dict)
+                    and candidate["message"].get("end_turn") is True
+                    for candidate in (event, event.get("v"))
+                )
+                or (event.get("p") == "/message/end_turn" and event.get("v") is True)
+                or (
+                    event.get("o") == "patch"
+                    and isinstance(event.get("v"), list)
+                    and any(
+                        isinstance(item, dict) and item.get("p") == "/message/end_turn" and item.get("v") is True
+                        for item in event["v"]
+                    )
+                )
+            )
+            if has_end_turn:
+                # 生图流已拿到图片资产且上游标记本轮 end_turn，立即收尾避免挂起至硬超时
+                yield conversation_base_event("conversation.done", state, done=True)
+                break
 
 
 def conversation_events(
@@ -1173,39 +1211,111 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-            quality=request.quality,
-    ):
-        last = event
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
+    stream_hard_timeout: ImageStreamHardTimeoutError | None = None
+    try:
+        for event in conversation_events(
+                backend,
+                prompt=request.prompt,
                 model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-            )
+                images=request.images or [],
+                size=request.size,
+                quality=request.quality,
+        ):
+            last = event
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                )
+    except ImageStreamHardTimeoutError as exc:
+        stream_hard_timeout = exc
 
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
+    if stream_hard_timeout is not None:
+        # SSE 命中硬超时时，优先抢救流中已收到的资产或做一次短快照检查，避免丢弃已生成的图片
+        if not file_ids and not sediment_ids and conversation_id:
+            try:
+                snapshot = backend._get_conversation(conversation_id, timeout_secs=8.0)
+                for record in backend._extract_image_tool_records(snapshot):
+                    add_unique(file_ids, record.get("file_ids") or [])
+                    add_unique(sediment_ids, record.get("sediment_ids") or [])
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_stream_hard_timeout_snapshot_failed",
+                    "conversation_id": conversation_id,
+                    "error": repr(exc)[:300],
+                })
+        if file_ids or sediment_ids:
+            logger.info({
+                "event": "image_stream_hard_timeout_rescued",
+                "conversation_id": conversation_id,
+                "file_ids": file_ids,
+                "sediment_ids": sediment_ids,
+            })
+            had_deadline = hasattr(backend, "image_request_deadline")
+            previous_deadline = getattr(backend, "image_request_deadline", None)
+            backend.image_request_deadline = time.monotonic() + 15.0
+            try:
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id, file_ids, sediment_ids, poll=False,
+                )
+                if image_urls:
+                    if request.progress_callback:
+                        request.progress_callback("receiving_image")
+                    image_items = [
+                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                        for image_data in backend.download_image_bytes(image_urls)
+                    ]
+                    data = format_image_result(
+                        image_items,
+                        request.prompt,
+                        request.response_format,
+                        request.base_url,
+                        int(time.time()),
+                    )["data"]
+                    if data:
+                        _remove_image_conversation_later(backend, conversation_id)
+                        yield ImageOutput(
+                            kind="result",
+                            model=request.model,
+                            index=index,
+                            total=total,
+                            data=data,
+                            conversation_id=conversation_id,
+                        )
+                        return
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_stream_hard_timeout_rescue_download_failed",
+                    "conversation_id": conversation_id,
+                    "error": repr(exc)[:300],
+                })
+            finally:
+                if had_deadline:
+                    backend.image_request_deadline = previous_deadline
+                elif hasattr(backend, "image_request_deadline"):
+                    delattr(backend, "image_request_deadline")
+        if conversation_id:
+            setattr(stream_hard_timeout, "conversation_id", conversation_id)
+        raise stream_hard_timeout
+
     message = str(last.get("text") or "").strip()
     is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
     logger.info({
@@ -1215,6 +1325,7 @@ def stream_image_outputs(
         "sediment_ids": sediment_ids,
         "tool_invoked": last.get("tool_invoked"),
         "turn_use_case": last.get("turn_use_case"),
+        "tool_name": last.get("tool_name"),
     })
     if request.progress_callback:
         request.progress_callback("image_stream_resolve_start")
@@ -1224,7 +1335,13 @@ def stream_image_outputs(
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    # 新版上游 server_ste_metadata 不再保证返回 turn_use_case="image gen"，补充 tool_invoked 与 ImageGen 工具名判定
+    should_poll_for_image = (
+        bool(request.images)
+        or last.get("turn_use_case") == "image gen"
+        or last.get("tool_invoked") is True
+        or "imagegen" in str(last.get("tool_name") or "").lower()
+    )
     if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1268,9 +1385,9 @@ def stream_image_outputs(
     # （如 {"size":"1792x1024","n":1}）标记为 is_error，而实际上图片正在异步生成中。
     # 此时应继续轮询图片。
     detailed_error = ""
-    if not file_ids and not sediment_ids and conversation_id:
+    if not file_ids and not sediment_ids and conversation_id and not should_poll_for_image and not is_text_reply:
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
-        if detailed_error and not should_poll_for_image and not is_text_reply:
+        if detailed_error:
             logger.info({
                 "event": "image_task_error_before_poll",
                 "conversation_id": conversation_id,
@@ -1278,12 +1395,6 @@ def stream_image_outputs(
             })
             yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=detailed_error, conversation_id=conversation_id)
             return
-        if detailed_error and (should_poll_for_image or is_text_reply):
-            logger.info({
-                "event": "image_task_error_skipped_for_poll",
-                "conversation_id": conversation_id,
-                "error": detailed_error,
-            })
 
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
@@ -1670,6 +1781,7 @@ def _generate_single_image(
                 plan_type=plan_type,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                deadline=request_deadline,
             )
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
@@ -1706,7 +1818,9 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=output.conversation_id,
                     )
-                emitted_for_token = True
+                # progress 仅用于内部状态缓冲，不应阻断异常时的换号/重试路径
+                if output.kind != "progress":
+                    emitted_for_token = True
                 returned_message = output.kind == "message"
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
@@ -1715,7 +1829,7 @@ def _generate_single_image(
                 return outputs
             if not returned_result:
                 account_service.mark_image_result(token, False)
-                if emitted_for_token:
+                if outputs:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
                         "upstream completed without generating images",
@@ -1729,7 +1843,7 @@ def _generate_single_image(
             account_service.mark_image_result(token, True)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(token, False, cooldown_secs=float(config.image_timeout_retry_secs))
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1845,6 +1959,18 @@ def _generate_single_image(
                     code="upload_limit_exceeded",
                     account_email=account_email,
                 ) from exc
+            if not emitted_for_token and isinstance(exc, ImageStreamHardTimeoutError):
+                poll_timeout_retry_count += 1
+                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES and request_deadline > time.monotonic():
+                    logger.warning({
+                        "event": "image_stream_hard_timeout_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": poll_timeout_retry_count,
+                        "index": index,
+                        "error": last_error[:200],
+                    })
+                    continue
             if not emitted_for_token and is_image_concurrency_error(exc):
                 concurrency_retry_count += 1
                 if concurrency_retry_count <= MAX_CONCURRENCY_RETRIES and request_deadline > time.monotonic():
@@ -1899,7 +2025,11 @@ def _generate_single_image(
                     })
                     _sleep_until_deadline(request_deadline, wait_secs)
                     continue
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+            raise ImageGenerationError(
+                image_stream_error_message(last_error),
+                account_email=account_email,
+                conversation_id=str(getattr(exc, "conversation_id", "") or ""),
+            ) from exc
         finally:
             if backend is not None:
                 backend.close()

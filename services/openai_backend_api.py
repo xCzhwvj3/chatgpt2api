@@ -16,7 +16,7 @@ from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlencode, urlparse
 
 from curl_cffi import requests
 from PIL import Image
@@ -66,7 +66,7 @@ class ChatRequirements:
     raw_finalize: Optional[Dict[str, Any]] = None
 
 
-DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
+DEFAULT_CLIENT_VERSION = "prod-b6348792a294e8e04a67660959ba41914937938f"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
@@ -74,17 +74,38 @@ CODEX_RESPONSES_MODEL = "gpt-5.5"
 TEXT_STREAM_TIMEOUT_SECS = 300.0
 IMAGE_FILE_THROTTLE_RETRIES = 3
 IMAGE_FILE_THROTTLE_BACKOFF_SECS = (1.0, 2.0, 4.0)
-SEARCH_MODEL = "gpt-5-5"
+SEARCH_MODEL = "gpt-6"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
-EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
+EDITABLE_FILE_MODEL = "gpt-6"
 EDITABLE_FILE_THINKING_EFFORT = "extended"
 EDITABLE_FILE_TIMEOUT_SECS = 1200.0
 EDITABLE_FILE_POLL_INTERVAL_SECS = 5.0
-EDITABLE_FILE_CLIENT_VERSION = "prod-bede35f9dcd856d080e012478f0c1031faa2588e"
+EDITABLE_FILE_CLIENT_VERSION = DEFAULT_CLIENT_VERSION
+# 兼容旧模型调用：将已下线的旧模型名映射到当前 ChatGPT 上游实际可用模型
+LEGACY_TEXT_MODEL_MAP = {
+    "gpt-5-5-thinking": "gpt-6",
+    "gpt-5-5": "gpt-6",
+    "gpt-5-3": "gpt-6",
+    "gpt-5-2": "gpt-6",
+    "gpt-5-1": "gpt-6",
+    "gpt-5": "gpt-6",
+    "gpt-5-5-mini": "gpt-6-mini",
+    "gpt-5-3-mini": "gpt-6-mini",
+    "gpt-5-2-mini": "gpt-6-mini",
+    "gpt-5-1-mini": "gpt-6-mini",
+    "gpt-5-mini": "gpt-6-mini",
+}
+LEGACY_IMAGE_MODEL_MAP = {
+    **LEGACY_TEXT_MODEL_MAP,
+    # 对齐网页端 /images 链路：发送 auto + picture_v2 由上游路由至最新生图模型
+    "gpt-image-2": "auto",
+    "gpt-image-2.5-flare": "gpt-image-2.6-flare",
+    "gpt-image-2.5-sunburst": "gpt-image-2.6-sunburst",
+}
 EDITABLE_FILE_CLIENT_BUILD_NUMBER = "6631702"
 EDITABLE_FILE_PSD_OUTPUT_DIR = "data/files/psd"
 EDITABLE_FILE_PPT_OUTPUT_DIR = "data/files/ppt"
@@ -395,6 +416,11 @@ class OpenAIBackendAPI:
         headers = dict(self.session.headers)
         headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
+        account = getattr(self, "account", None)
+        if isinstance(account, dict):
+            account_id = str(account.get("account_id") or "").strip()
+            if account_id:
+                headers["ChatGPT-Account-Id"] = account_id
         if extra:
             headers.update(extra)
         return headers
@@ -654,7 +680,7 @@ class OpenAIBackendAPI:
         payload = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
-            "model": model,
+            "model": self._resolve_text_model_slug(model),
             "parent_message_id": new_uuid(),
             "conversation_mode": {"kind": "primary_assistant"},
             "conversation_origin": None,
@@ -688,19 +714,31 @@ class OpenAIBackendAPI:
             payload["thinking_effort"] = normalized_effort
         return payload
 
+    @staticmethod
+    def _resolve_text_model_slug(model: str) -> str:
+        """将已下线的旧文本/思考模型名兼容映射到当前上游可用模型。"""
+        slug = str(model or "").strip()
+        if not slug:
+            return "auto"
+        return LEGACY_TEXT_MODEL_MAP.get(slug.lower(), slug)
+
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto"
-        if base_model == "gpt-image-2":
-            return "gpt-5-5-thinking"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
-        return base_model
+        return LEGACY_IMAGE_MODEL_MAP.get(base_model, base_model)
 
-    def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
-            Dict[str, str]:
+    def _image_headers(
+            self,
+            path: str,
+            requirements: ChatRequirements,
+            conduit_token: str = "",
+            accept: str = "*/*",
+            turn_trace_id: str = "",
+    ) -> Dict[str, str]:
         """构造图片链路请求头。"""
         headers = {
             "Content-Type": "application/json",
@@ -709,9 +747,13 @@ class OpenAIBackendAPI:
         }
         if requirements.proof_token:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+        if requirements.so_token:
+            headers["OpenAI-Sentinel-SO-Token"] = requirements.so_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
-        if accept == "text/event-stream":
+        if turn_trace_id:
+            headers["X-Oai-Turn-Trace-Id"] = turn_trace_id
+        elif accept == "text/event-stream":
             headers["X-Oai-Turn-Trace-Id"] = new_uuid()
         return self._headers(path, headers)
 
@@ -997,13 +1039,19 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    def _prepare_image_conversation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            model: str,
+            turn_trace_id: str = "",
+    ) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": "client-created-root",
             "model": self._image_model_slug(model),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
@@ -1021,7 +1069,7 @@ class OpenAIBackendAPI:
         }
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements),
+            headers=self._image_headers(path, requirements, turn_trace_id=turn_trace_id),
             json=payload,
             timeout=self._deadline_timeout_secs(60),
         )
@@ -1102,8 +1150,15 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
-    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+    def _start_image_generation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            conduit_token: str,
+            model: str,
+            references: Optional[list[Dict[str, Any]]] = None,
+            turn_trace_id: str = "",
+    ) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -1141,7 +1196,7 @@ class OpenAIBackendAPI:
                 "content": content,
                 "metadata": metadata,
             }],
-            "parent_message_id": new_uuid(),
+            "parent_message_id": "client-created-root",
             "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
@@ -1162,12 +1217,11 @@ class OpenAIBackendAPI:
                 "app_name": "chatgpt.com",
             },
             "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream", turn_trace_id=turn_trace_id),
             json=payload,
             timeout=self._image_request_timeout_secs(),
             stream=True,
@@ -1979,7 +2033,7 @@ class OpenAIBackendAPI:
                 "action": "next",
                 "fork_from_shared_post": False,
                 "parent_message_id": "client-created-root",
-                "model": model,
+                "model": self._resolve_text_model_slug(model),
                 "client_prepare_state": "success",
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
@@ -2020,7 +2074,7 @@ class OpenAIBackendAPI:
                     },
                 }],
                 "parent_message_id": "client-created-root",
-                "model": model,
+                "model": self._resolve_text_model_slug(model),
                 "client_prepare_state": "success",
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
@@ -2223,7 +2277,13 @@ class OpenAIBackendAPI:
             role = str(author.get("role") or "").strip().lower()
             if role not in {"tool", "assistant"}:
                 continue
-            is_image_gen = metadata.get("async_task_type") == "image_gen"
+            # 新版上游生图工具消息使用工具名 t2uay3k.sj1i4kz 或 image_gen_title 标识，不再附带 async_task_type
+            author_name = str(author.get("name") or "").strip()
+            is_image_gen = (
+                metadata.get("async_task_type") == "image_gen"
+                or author_name == "t2uay3k.sj1i4kz"
+                or bool(metadata.get("image_gen_title"))
+            )
             has_asset_pointer = self._has_image_asset_pointer(content) or self._has_image_asset_pointer(metadata)
             if role == "assistant" and not (is_image_gen or has_asset_pointer):
                 continue
@@ -2312,13 +2372,15 @@ class OpenAIBackendAPI:
         def _remaining() -> float:
             return timeout_secs - (time.time() - start)
 
+        # 至少预留 5 秒给首次 _get_conversation 查询，避免 initial_wait/settle 耗尽整个剩余预算导致 0 次轮询超时
         if has_initial_ids and config.image_settle_enabled:
-            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
+            available_wait = max(0.0, _remaining() - 5.0)
+            settle_for = min(config.image_settle_secs, available_wait)
             if settle_for > 0:
                 time.sleep(settle_for)
         elif initial_wait > 0:
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
-            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
+            sleep_for = min(initial_wait + jitter, max(0.0, _remaining() - 5.0))
             if sleep_for > 0:
                 time.sleep(sleep_for)
 
@@ -2348,34 +2410,6 @@ class OpenAIBackendAPI:
         last_task_error = ""
         while _remaining() > 0:
             attempt += 1
-            # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
-            # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
-            last_task_error = ""
-            try:
-                tasks = self._query_backend_tasks(
-                    conversation_id=conversation_id,
-                    timeout_secs=min(5.0, max(0.001, _remaining())),
-                )
-                for task in tasks:
-                    is_error, error_msg, metadata = self.check_task_error(task)
-                    if is_error and error_msg:
-                        last_task_error = error_msg
-                        logger.info({
-                            "event": "image_poll_task_error_not_blocking",
-                            "conversation_id": conversation_id,
-                            "attempt": attempt,
-                            "error_msg": error_msg,
-                            "metadata": metadata,
-                        })
-            except Exception as exc:
-                # tasks 查询失败不影响正常轮询流程
-                logger.debug({
-                    "event": "image_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "error": str(exc),
-                })
-
             try:
                 conversation = self._get_conversation(
                     conversation_id,
@@ -2447,6 +2481,28 @@ class OpenAIBackendAPI:
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
                 time.sleep(wait)
+        # 仅在轮询耗尽且未拿到图片时查询一次 /backend-api/tasks，避免每次轮询同步阻塞并触发限流
+        if not file_ids and not sediment_ids:
+            try:
+                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                for task in tasks:
+                    is_error, error_msg, metadata = self.check_task_error(task)
+                    if is_error and error_msg:
+                        last_task_error = error_msg
+                        logger.info({
+                            "event": "image_poll_task_error_on_timeout",
+                            "conversation_id": conversation_id,
+                            "attempt": attempt,
+                            "error_msg": error_msg,
+                            "metadata": metadata,
+                        })
+            except Exception as exc:
+                logger.debug({
+                    "event": "image_poll_task_check_failed",
+                    "conversation_id": conversation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                })
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
@@ -2468,6 +2524,29 @@ class OpenAIBackendAPI:
 
     def _get_file_download_url(self, file_id: str, timeout_secs: float = 60.0) -> str:
         """获取文件下载地址。"""
+        # 新版网页端优先走 /backend-api/files/download/{file_id}，失败时自动回退旧接口
+        conversation_id = str(getattr(self, "_resolve_conversation_id", "") or "").strip()
+        if conversation_id:
+            route = f"/backend-api/files/download/{file_id}"
+            query = urlencode({
+                "conversation_id": conversation_id,
+                "download_intent": "false",
+                "inline": "true",
+            })
+            path = f"{route}?{query}"
+            try:
+                response = self.session.get(
+                    self.base_url + path,
+                    headers=self._headers(path, {"Accept": "application/json", "X-OpenAI-Target-Route": route}),
+                    timeout=timeout_secs,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    url = data.get("download_url") or data.get("url") or ""
+                    if url:
+                        return url
+            except Exception:
+                pass
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=timeout_secs)
@@ -2564,38 +2643,80 @@ class OpenAIBackendAPI:
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
+        resolved_ids: set[str] = set()
         skip_patterns = {"file_upload"}
-        for file_id in file_ids:
-            if file_id in skip_patterns:
+        previous_conversation_id = getattr(self, "_resolve_conversation_id", "")
+        self._resolve_conversation_id = conversation_id
+        try:
+            for file_id in file_ids:
+                if file_id in skip_patterns:
+                    logger.debug({
+                        "event": "image_file_id_skipped",
+                        "source": "file",
+                        "conversation_id": conversation_id,
+                        "id": file_id,
+                    })
+                    continue
+                try:
+                    url = self._get_file_download_url(file_id, timeout_secs=self._deadline_timeout_secs(60))
+                except Exception as exc:
+                    logger.debug({
+                        "event": "image_download_url_failed",
+                        "source": "file",
+                        "conversation_id": conversation_id,
+                        "id": file_id,
+                        "error": repr(exc),
+                    })
+                    continue
+                if url:
+                    resolved_ids.add(file_id)
+                    if url not in urls:
+                        urls.append(url)
+                else:
+                    logger.debug({
+                        "event": "image_download_url_empty",
+                        "source": "file",
+                        "conversation_id": conversation_id,
+                        "id": file_id,
+                    })
+            if not conversation_id or not sediment_ids:
                 logger.debug({
-                    "event": "image_file_id_skipped",
-                    "source": "file",
+                    "event": "image_urls_resolved",
                     "conversation_id": conversation_id,
-                    "id": file_id,
+                    "file_ids": file_ids,
+                    "sediment_ids": sediment_ids,
+                    "urls": urls,
                 })
-                continue
-            try:
-                url = self._get_file_download_url(file_id, timeout_secs=self._deadline_timeout_secs(60))
-            except Exception as exc:
-                logger.debug({
-                    "event": "image_download_url_failed",
-                    "source": "file",
-                    "conversation_id": conversation_id,
-                    "id": file_id,
-                    "error": repr(exc),
-                })
-                continue
-            if url:
-                if url not in urls:
-                    urls.append(url)
-            else:
-                logger.debug({
-                    "event": "image_download_url_empty",
-                    "source": "file",
-                    "conversation_id": conversation_id,
-                    "id": file_id,
-                })
-        if not conversation_id or not sediment_ids:
+                return urls
+            for sediment_id in sediment_ids:
+                # 同一个图片 ID 若已通过 file_ids 解析出下载地址，不再重复调用附件下载接口
+                if sediment_id in resolved_ids:
+                    continue
+                try:
+                    url = self._get_attachment_download_url(
+                        conversation_id,
+                        sediment_id,
+                        timeout_secs=self._deadline_timeout_secs(60),
+                    )
+                except Exception as exc:
+                    logger.debug({
+                        "event": "image_download_url_failed",
+                        "source": "sediment",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                        "error": repr(exc),
+                    })
+                    continue
+                if url:
+                    if url not in urls:
+                        urls.append(url)
+                else:
+                    logger.debug({
+                        "event": "image_download_url_empty",
+                        "source": "sediment",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                    })
             logger.debug({
                 "event": "image_urls_resolved",
                 "conversation_id": conversation_id,
@@ -2604,40 +2725,8 @@ class OpenAIBackendAPI:
                 "urls": urls,
             })
             return urls
-        for sediment_id in sediment_ids:
-            try:
-                url = self._get_attachment_download_url(
-                    conversation_id,
-                    sediment_id,
-                    timeout_secs=self._deadline_timeout_secs(60),
-                )
-            except Exception as exc:
-                logger.debug({
-                    "event": "image_download_url_failed",
-                    "source": "sediment",
-                    "conversation_id": conversation_id,
-                    "id": sediment_id,
-                    "error": repr(exc),
-                })
-                continue
-            if url:
-                if url not in urls:
-                    urls.append(url)
-            else:
-                logger.debug({
-                    "event": "image_download_url_empty",
-                    "source": "sediment",
-                    "conversation_id": conversation_id,
-                    "id": sediment_id,
-                })
-        logger.debug({
-            "event": "image_urls_resolved",
-            "conversation_id": conversation_id,
-            "file_ids": file_ids,
-            "sediment_ids": sediment_ids,
-            "urls": urls,
-        })
-        return urls
+        finally:
+            self._resolve_conversation_id = previous_conversation_id
 
     def resolve_conversation_image_urls(
             self,
@@ -2774,9 +2863,10 @@ class OpenAIBackendAPI:
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        turn_trace_id = new_uuid()
+        conduit_token = self._prepare_image_conversation(prompt, requirements, model, turn_trace_id=turn_trace_id)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, turn_trace_id=turn_trace_id)
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, self._image_stream_hard_cap_secs())
 
@@ -2800,7 +2890,7 @@ class OpenAIBackendAPI:
         watchdog.daemon = True
         watchdog.start()
         timeout_message = (
-            f"图片生成流已超过硬上限 {normalized_cap:g} 秒，"
+            f"图片生成流超时（已超过硬上限 {normalized_cap:g} 秒），"
             "已强制中断（上游可能未生成图片）"
         )
         try:

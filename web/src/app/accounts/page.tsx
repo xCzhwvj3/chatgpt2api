@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  Upload,
   UserRound,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -90,7 +91,8 @@ const metricCards = [
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "quota", label: "生图额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "uploadQuota", label: "上传额度", color: "text-violet-600", icon: Upload },
 ] as const;
 
 function formatCompact(value: number) {
@@ -102,6 +104,22 @@ function formatCompact(value: number) {
 
 function formatQuota(account: Account) {
   return String(Math.max(0, account.quota));
+}
+
+function getAccountUploadQuota(account: Account): number | null {
+  if (typeof account.upload_quota === "number" && !Number.isNaN(account.upload_quota)) {
+    return Math.max(0, account.upload_quota);
+  }
+  const entry = account.limits_progress?.find((item) => item?.feature_name === "file_upload");
+  if (entry && typeof entry.remaining === "number" && !Number.isNaN(entry.remaining)) {
+    return Math.max(0, entry.remaining);
+  }
+  return null;
+}
+
+function formatUploadQuota(account: Account) {
+  const value = getAccountUploadQuota(account);
+  return value === null ? "—" : String(value);
 }
 
 function formatRestoreAt(value?: string | null) {
@@ -131,6 +149,13 @@ function formatRestoreAt(value?: string | null) {
 function formatQuotaSummary(accounts: Account[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+function formatUploadQuotaSummary(accounts: Account[]) {
+  const availableAccounts = accounts.filter((account) => account.status === "正常");
+  return formatCompact(
+    availableAccounts.reduce((sum, account) => sum + Math.max(0, getAccountUploadQuota(account) ?? 0), 0),
+  );
 }
 
 function maskToken(token?: string) {
@@ -272,8 +297,9 @@ function AccountsPageContent() {
     const abnormal = accounts.filter((item) => item.status === "异常").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
+    const uploadQuota = formatUploadQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, active, limited, abnormal, disabled, quota, uploadQuota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -368,6 +394,7 @@ function AccountsPageContent() {
     const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
     const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
     const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
+    const baseUploadQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, getAccountUploadQuota(a) ?? 0), 0);
 
     // 显示进度条（只显示当前任务，不含分类统计）
     const total = accessTokens.length;
@@ -424,6 +451,7 @@ function AccountsPageContent() {
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
                 quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
+                uploadQuota: formatCompact(baseUploadQuotaNum + (p.total_upload_quota ?? 0)),
               });
             }
           } catch (err) {
@@ -612,6 +640,7 @@ function AccountsPageContent() {
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
                 quota: summary.quota,
+                uploadQuota: summary.uploadQuota,
               });
             }
           } catch (err) {
@@ -846,7 +875,7 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-3 md:grid-cols-4 xl:grid-cols-7">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key];
@@ -1050,7 +1079,8 @@ function AccountsPageContent() {
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
-                    <th className="w-24 px-4 py-3">额度</th>
+                    <th className="w-24 px-4 py-3">生图额度</th>
+                    <th className="w-24 px-4 py-3">上传额度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
                     <th className="w-18 px-4 py-3">在途</th>
                     <th className="w-18 px-4 py-3">成功</th>
@@ -1135,9 +1165,28 @@ function AccountsPageContent() {
                             {formatQuota(account)}
                           </Badge>
                         </td>
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const uploadQuota = getAccountUploadQuota(account);
+                            return (
+                              <Badge
+                                variant={uploadQuota === 0 ? "warning" : "secondary"}
+                                className={
+                                  uploadQuota === 0
+                                    ? "rounded-md"
+                                    : "rounded-md bg-violet-50 text-violet-700"
+                                }
+                              >
+                                {formatUploadQuota(account)}
+                              </Badge>
+                            );
+                          })()}
+                        </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {
-                            const restore = formatRestoreAt(account.restore_at);
+                            const restore = formatRestoreAt(
+                              account.restore_at ?? account.upload_restore_at ?? account.upload_limited_until,
+                            );
                             return (
                               <div className="space-y-0.5">
                                 {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}

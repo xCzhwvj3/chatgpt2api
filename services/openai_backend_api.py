@@ -426,11 +426,16 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
+    def _extract_feature_limit(limits_progress: list[Any], feature_name: str) -> tuple[int | None, str | None]:
         for item in limits_progress:
-            if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
-        return 0, None
+            if isinstance(item, dict) and item.get("feature_name") == feature_name:
+                return max(0, int(item.get("remaining") or 0)), str(item.get("reset_after") or "") or None
+        return None, None
+
+    @classmethod
+    def _extract_quota_and_restore_at(cls, limits_progress: list[Any]) -> tuple[int, str | None]:
+        remaining, reset_after = cls._extract_feature_limit(limits_progress, "image_gen")
+        return (remaining if remaining is not None else 0), reset_after
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
@@ -504,15 +509,23 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
+        upload_quota, upload_restore_at = self._extract_feature_limit(limits_progress, "file_upload")
+        upload_exhausted = upload_quota is not None and upload_quota == 0
+        effective_restore_at = restore_at
+        if upload_exhausted and upload_restore_at:
+            if not effective_restore_at or upload_restore_at > effective_restore_at:
+                effective_restore_at = upload_restore_at
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
             "quota": quota,
+            "upload_quota": upload_quota,
+            "upload_restore_at": upload_restore_at,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
-            "restore_at": restore_at,
-            "status": "限流" if quota == 0 else "正常",
+            "restore_at": effective_restore_at,
+            "status": "限流" if (quota == 0 or upload_exhausted) else "正常",
         }
         logger.debug({
             "event": "backend_user_info_result",
@@ -520,6 +533,7 @@ class OpenAIBackendAPI:
             "user_id": result.get("user_id"),
             "type": result.get("type"),
             "quota": result.get("quota"),
+            "upload_quota": result.get("upload_quota"),
             "default_model_slug": result.get("default_model_slug"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),

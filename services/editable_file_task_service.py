@@ -13,7 +13,7 @@ from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
-from utils.helper import new_uuid
+from utils.helper import is_upload_limit_error, new_uuid
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -53,16 +53,22 @@ def _file_url(path: Path, base_url: str) -> str:
     return f"{prefix}/files/{quote(rel, safe='/')}" if prefix else f"/files/{quote(rel, safe='/')}"
 
 
-def _editable_access_token() -> str:
+def _editable_access_token(required_upload_quota: int = 0) -> str:
     accounts = [
         item for item in account_service.list_accounts()
         if _clean(item.get("access_token"))
            and item.get("status") not in {"禁用", "异常"}
            and account_service._account_matches_any_plan_type(item, EDITABLE_FILE_PLAN_TYPES)
+           and (required_upload_quota <= 0 or account_service._has_enough_upload_quota(item, required_upload_quota))
     ]
     if not accounts:
+        if required_upload_quota > 0:
+            raise RuntimeError(f"no available plus/team/pro account with upload quota >= {required_upload_quota}")
         raise RuntimeError("no available plus/team/pro account")
-    accounts.sort(key=lambda item: _clean(item.get("last_used_at")))
+    if required_upload_quota > 0:
+        accounts.sort(key=account_service._upload_quota_sort_key)
+    else:
+        accounts.sort(key=lambda item: _clean(item.get("last_used_at")))
     token = _clean(accounts[0].get("access_token"))
     return account_service.refresh_access_token(token, event="editable_file_task") or token
 
@@ -135,17 +141,22 @@ class EditableFileTaskService:
         try:
             if kind == "psd" and not base64_images:
                 raise ValueError("base64_images is empty")
-            token = _editable_access_token()
+            upload_count = len(base64_images) if kind == "psd" else 0
+            token = _editable_access_token(required_upload_quota=upload_count)
             account = account_service.get_account(token) or {}
             account_email = _clean(account.get("email"))
             backend = OpenAIBackendAPI(token)
             output_dir = EDITABLE_FILE_ROOT / kind / key.rsplit(":", 1)[-1]
             result = backend.export_psd_zip(base64_images, prompt, output_dir) if kind == "psd" else backend.export_ppt_zip(base64_images, prompt, output_dir)
             account_service.mark_text_used(token)
+            if upload_count > 0:
+                account_service.consume_upload_quota(token, upload_count)
             data = {"conversation_id": result.conversation_id, "primary_url": _file_url(result.primary_path, base_url), "zip_url": _file_url(result.zip_path, base_url)}
             self._update_task(key, status=TASK_STATUS_SUCCESS, result=data, account_email=account_email, error="", ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), account_email=account_email, result=data)
         except Exception as exc:
+            if token and is_upload_limit_error(exc):
+                account_service.mark_upload_rate_limited(token, reason=str(exc))
             error = str(exc) or "editable file task failed"
             self._update_task(key, status=TASK_STATUS_ERROR, error=error, account_email=account_email, ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), status="failed", error=error, account_email=account_email)

@@ -22,6 +22,9 @@ export type Account = {
   source_type?: string | null;
   status: AccountStatus;
   quota: number;
+  upload_quota?: number | null;
+  upload_restore_at?: string | null;
+  upload_limited_until?: string | null;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -92,6 +95,7 @@ export type RefreshProgressResponse = {
   error: string | null;
   status_counts?: Record<string, number>;
   total_quota?: number;
+  total_upload_quota?: number;
   result?: AccountRefreshResponse | null;
   results?: Array<{ token: string; status: string; error?: string | null }>;
 };
@@ -397,6 +401,7 @@ export async function updateAccount(
     type?: AccountType;
     status?: AccountStatus;
     quota?: number;
+    upload_quota?: number;
     proxy?: string;
   },
 ) {

@@ -28,6 +28,7 @@ class AccountService:
     _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
+    _UPLOAD_LIMIT_COOLDOWN_HOURS = 24
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
@@ -198,12 +199,91 @@ class AccountService:
             )
 
     @staticmethod
-    def _is_image_account_available(account: dict) -> bool:
+    def _extract_upload_limit_from_progress(limits_progress: Any) -> tuple[int | None, str | None]:
+        if not isinstance(limits_progress, list):
+            return None, None
+        for item in limits_progress:
+            if isinstance(item, dict) and item.get("feature_name") == "file_upload":
+                return max(0, int(item.get("remaining") or 0)), str(item.get("reset_after") or "") or None
+        return None, None
+
+    @staticmethod
+    def _sync_upload_limit_in_progress(
+        limits_progress: Any,
+        remaining: int,
+        reset_after: str | None = None,
+    ) -> list[dict]:
+        items = [dict(item) if isinstance(item, dict) else item for item in (limits_progress if isinstance(limits_progress, list) else [])]
+        for item in items:
+            if isinstance(item, dict) and item.get("feature_name") == "file_upload":
+                item["remaining"] = max(0, int(remaining))
+                if reset_after:
+                    item["reset_after"] = reset_after
+                return items
+        entry: dict[str, Any] = {"feature_name": "file_upload", "remaining": max(0, int(remaining))}
+        if reset_after:
+            entry["reset_after"] = reset_after
+        items.append(entry)
+        return items
+
+    @classmethod
+    def _is_upload_cooldown_active(cls, account: dict, now: datetime | None = None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        until = cls._parse_time(account.get("upload_limited_until"))
+        if until is None:
+            return False
+        current_now = now or datetime.now(timezone.utc)
+        return until > current_now
+
+    @classmethod
+    def _effective_upload_quota(cls, account: dict, now: datetime | None = None) -> int | None:
+        if not isinstance(account, dict):
+            return 0
+        if cls._is_upload_cooldown_active(account, now):
+            return 0
+        raw = account.get("upload_quota")
+        if raw is None:
+            extracted, _ = cls._extract_upload_limit_from_progress(account.get("limits_progress"))
+            return extracted
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _has_enough_upload_quota(cls, account: dict, required_upload_quota: int = 0) -> bool:
+        if required_upload_quota <= 0:
+            return True
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
-        return int(account.get("quota") or 0) > 0
+        if cls._is_upload_cooldown_active(account):
+            return False
+        quota = cls._effective_upload_quota(account)
+        if quota is None:
+            return True
+        return quota >= required_upload_quota
+
+    @classmethod
+    def _upload_quota_sort_key(cls, account: dict) -> tuple[int, int, str]:
+        """按剩余上传额度升序排列（最小够用优先），无上限账号排在有明确额度的账号之后。"""
+        quota = cls._effective_upload_quota(account)
+        last_used = str(account.get("last_used_at") or "")
+        if quota is None:
+            return (1, 0, last_used)
+        return (0, quota, last_used)
+
+    @classmethod
+    def _is_image_account_available(cls, account: dict, required_upload_quota: int = 0) -> bool:
+        if not isinstance(account, dict):
+            return False
+        if account.get("status") in {"禁用", "限流", "异常"}:
+            return False
+        if int(account.get("quota") or 0) <= 0:
+            return False
+        return cls._has_enough_upload_quota(account, required_upload_quota)
 
     @classmethod
     def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
@@ -296,6 +376,17 @@ class AccountService:
         normalized["source_type"] = self._normalize_source_type(source_type)
         limits_progress = normalized.get("limits_progress")
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
+        extracted_upload_quota, extracted_upload_restore_at = self._extract_upload_limit_from_progress(normalized["limits_progress"])
+        raw_upload_quota = normalized.get("upload_quota")
+        if raw_upload_quota is None:
+            normalized["upload_quota"] = extracted_upload_quota
+        else:
+            try:
+                normalized["upload_quota"] = max(0, int(raw_upload_quota))
+            except (TypeError, ValueError):
+                normalized["upload_quota"] = extracted_upload_quota
+        normalized["upload_restore_at"] = normalized.get("upload_restore_at") or extracted_upload_restore_at or None
+        normalized["upload_limited_until"] = normalized.get("upload_limited_until") or None
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
@@ -967,12 +1058,13 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            required_upload_quota: int = 0,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
         return [
             token
             for item in self._accounts.values()
-            if self._is_image_account_available(item)
+            if self._is_image_account_available(item, required_upload_quota=required_upload_quota)
                and self._account_matches_plan_type(item, plan_type)
                and self._account_matches_any_plan_type(item, plan_types)
                and self._account_matches_source_type(item, source_type)
@@ -986,12 +1078,19 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            required_upload_quota: int = 0,
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         now = time.monotonic()
         return [
             token
-            for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+            for token in self._list_ready_candidate_tokens(
+                excluded_tokens,
+                plan_type,
+                source_type,
+                plan_types,
+                required_upload_quota=required_upload_quota,
+            )
             if int(self._image_inflight.get(token, 0)) < max_concurrency
                and float(self._image_cooldown_until.get(token, 0.0)) <= now
         ]
@@ -1003,18 +1102,44 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: float | None = None,
+            required_upload_quota: int = 0,
     ) -> str:
         with self._image_slot_condition:
             while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                if not self._list_ready_candidate_tokens(
+                    excluded_tokens,
+                    plan_type,
+                    source_type,
+                    plan_types,
+                    required_upload_quota=required_upload_quota,
+                ):
+                    if required_upload_quota > 0:
+                        raise RuntimeError(
+                            f"no available {plan_type or source_type or ''} account with upload quota >= {required_upload_quota}".replace("  ", " ").strip()
+                        )
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
                     )
-                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+                tokens = self._list_available_candidate_tokens(
+                    excluded_tokens,
+                    plan_type,
+                    source_type,
+                    plan_types,
+                    required_upload_quota=required_upload_quota,
+                )
                 if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
+                    if required_upload_quota > 0:
+                        tokens.sort(
+                            key=lambda tk: (
+                                *self._upload_quota_sort_key(self._accounts.get(tk) or {}),
+                                int(self._image_inflight.get(tk, 0)),
+                            )
+                        )
+                        access_token = tokens[0]
+                    else:
+                        access_token = tokens[self._index % len(tokens)]
+                        self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 wait_secs = 1.0
@@ -1043,11 +1168,12 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: float | None = None,
+            required_upload_quota: int = 0,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
-        限制最大尝试次数防止 token rotation 导致无限循环。
+        当携带参考图（required_upload_quota > 0）时，优先选用剩余上传额度最少但足够容纳本次请求的账号。
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
@@ -1060,6 +1186,7 @@ class AccountService:
                 source_type=source_type,
                 plan_types=plan_types,
                 deadline=deadline,
+                required_upload_quota=required_upload_quota,
             )
             attempted_tokens.add(access_token)
             try:
@@ -1073,7 +1200,7 @@ class AccountService:
             if resolved and resolved != access_token:
                 attempted_tokens.add(resolved)
             if (
-                    self._is_image_account_available(account or {})
+                    self._is_image_account_available(account or {}, required_upload_quota=required_upload_quota)
                     and self._account_matches_plan_type(account or {}, plan_type)
                     and self._account_matches_any_plan_type(account or {}, plan_types)
                     and self._account_matches_source_type(account or {}, source_type)
@@ -1085,20 +1212,37 @@ class AccountService:
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def get_text_access_token(
+            self,
+            excluded_tokens: set[str] | None = None,
+            required_upload_quota: int = 0,
+    ) -> str:
         excluded = set(excluded_tokens or set())
         with self._lock:
-            candidates = [
-                token
-                for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
-                   and (token := account.get("access_token") or "")
-                   and token not in excluded
-            ]
-            if not candidates:
-                return ""
-            access_token = candidates[self._index % len(candidates)]
-            self._index += 1
+            if required_upload_quota > 0:
+                candidate_accounts = [
+                    account
+                    for account in self._accounts.values()
+                    if self._has_enough_upload_quota(account, required_upload_quota)
+                       and (token := account.get("access_token") or "")
+                       and token not in excluded
+                ]
+                if not candidate_accounts:
+                    return ""
+                candidate_accounts.sort(key=self._upload_quota_sort_key)
+                access_token = str(candidate_accounts[0].get("access_token") or "")
+            else:
+                candidates = [
+                    token
+                    for account in self._accounts.values()
+                    if account.get("status") not in {"禁用", "异常"}
+                       and (token := account.get("access_token") or "")
+                       and token not in excluded
+                ]
+                if not candidates:
+                    return ""
+                access_token = candidates[self._index % len(candidates)]
+                self._index += 1
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
     def get_access_token_by_email(self, email: str) -> str:
@@ -1387,11 +1531,105 @@ class AccountService:
                 return False
         return True
 
+    def consume_upload_quota(self, access_token: str, count: int) -> dict | None:
+        """扣减账号文件上传额度；耗尽时自动标记为限流账号。"""
+        if not access_token or count <= 0:
+            return None
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return None
+            current_upload_quota = self._effective_upload_quota(current)
+            if current_upload_quota is None:
+                return dict(current)
+            next_item = dict(current)
+            next_quota = max(0, current_upload_quota - int(count))
+            next_item["upload_quota"] = next_quota
+            next_item["limits_progress"] = self._sync_upload_limit_in_progress(
+                next_item.get("limits_progress"),
+                next_quota,
+                next_item.get("upload_restore_at"),
+            )
+            if next_quota == 0:
+                next_item["status"] = "限流"
+                fallback_until = (datetime.now(timezone.utc) + timedelta(hours=self._UPLOAD_LIMIT_COOLDOWN_HOURS)).isoformat()
+                restore_target = next_item.get("upload_restore_at") or fallback_until
+                next_item["upload_restore_at"] = restore_target
+                if not next_item.get("restore_at") or restore_target > str(next_item.get("restore_at")):
+                    next_item["restore_at"] = restore_target
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+                self._accounts.pop(access_token, None)
+                self._save_accounts()
+                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+            return dict(account)
+
+    def mark_upload_rate_limited(
+        self,
+        access_token: str,
+        reason: str = "",
+        cooldown_hours: int | None = None,
+    ) -> dict | None:
+        """账号触发上游文件上传限额异常时，标记为限流并静置 1 天。"""
+        if not access_token:
+            return None
+        hours = max(1, int(cooldown_hours if cooldown_hours is not None else self._UPLOAD_LIMIT_COOLDOWN_HOURS))
+        until_iso = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return None
+            next_item = dict(current)
+            next_item["status"] = "限流"
+            next_item["upload_quota"] = 0
+            next_item["upload_limited_until"] = until_iso
+            next_item["upload_restore_at"] = until_iso
+            if not next_item.get("restore_at") or until_iso > str(next_item.get("restore_at")):
+                next_item["restore_at"] = until_iso
+            next_item["limits_progress"] = self._sync_upload_limit_in_progress(
+                next_item.get("limits_progress"),
+                0,
+                until_iso,
+            )
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            if config.auto_remove_rate_limited_accounts:
+                self._accounts.pop(access_token, None)
+                self._save_accounts()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "文件上传限流自动移除账号",
+                    {"token": anonymize_token(access_token), "email": account.get("email"), "reason": reason[:200]},
+                )
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                f"账号触发文件上传限流，静置 {hours} 小时",
+                {
+                    "token": anonymize_token(access_token),
+                    "email": account.get("email"),
+                    "restore_at": until_iso,
+                    "reason": reason[:200],
+                },
+            )
+            return dict(account)
+
     def mark_image_result(
         self,
         access_token: str,
         success: bool,
         cooldown_secs: float = 0.0,
+        upload_count: int = 0,
     ) -> dict | None:
         if not access_token:
             return None
@@ -1414,9 +1652,28 @@ class AccountService:
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
                 next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if next_item["quota"] == 0:
+                upload_exhausted = False
+                if upload_count > 0:
+                    cur_upload = self._effective_upload_quota(next_item)
+                    if cur_upload is not None:
+                        next_upload = max(0, cur_upload - int(upload_count))
+                        next_item["upload_quota"] = next_upload
+                        next_item["limits_progress"] = self._sync_upload_limit_in_progress(
+                            next_item.get("limits_progress"),
+                            next_upload,
+                            next_item.get("upload_restore_at"),
+                        )
+                        upload_exhausted = next_upload == 0
+                if next_item["quota"] == 0 or upload_exhausted or self._is_upload_cooldown_active(next_item):
                     next_item["status"] = "限流"
-                    next_item["restore_at"] = next_item.get("restore_at") or None
+                    if upload_exhausted:
+                        fallback_until = (datetime.now(timezone.utc) + timedelta(hours=self._UPLOAD_LIMIT_COOLDOWN_HOURS)).isoformat()
+                        restore_target = next_item.get("upload_restore_at") or fallback_until
+                        next_item["upload_restore_at"] = restore_target
+                        if not next_item.get("restore_at") or restore_target > str(next_item.get("restore_at")):
+                            next_item["restore_at"] = restore_target
+                    else:
+                        next_item["restore_at"] = next_item.get("restore_at") or None
                 elif next_item.get("status") == "限流":
                     next_item["status"] = "正常"
             else:
@@ -1480,6 +1737,22 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
+        existing = self.get_account(active_token)
+        if existing and self._is_upload_cooldown_active(existing):
+            until_iso = str(existing.get("upload_limited_until") or "")
+            result["status"] = "限流"
+            result["upload_quota"] = 0
+            result["upload_limited_until"] = until_iso
+            result["upload_restore_at"] = until_iso
+            if not result.get("restore_at") or until_iso > str(result.get("restore_at")):
+                result["restore_at"] = until_iso
+            result["limits_progress"] = self._sync_upload_limit_in_progress(
+                result.get("limits_progress"),
+                0,
+                until_iso,
+            )
+        else:
+            result["upload_limited_until"] = None
         return self.update_account(active_token, result)
 
     # ---- 刷新进度追踪 ----
@@ -1494,6 +1767,7 @@ class AccountService:
                 "error": None,
                 "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
                 "total_quota": 0,
+                "total_upload_quota": 0,
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
@@ -1501,6 +1775,7 @@ class AccountService:
         account = self.get_account(token)
         status = str(account.get("status") or "正常").strip() if account else "正常"
         quota = max(0, int(account.get("quota") or 0)) if account else 0
+        upload_quota = self._effective_upload_quota(account) if account else None
 
         with self._refresh_progress_lock:
             progress = self._refresh_progress.get(progress_id)
@@ -1509,6 +1784,8 @@ class AccountService:
             progress["processed"] += 1
             progress["status_counts"][status] = progress["status_counts"].get(status, 0) + 1
             progress["total_quota"] += quota
+            if status == "正常" and upload_quota is not None:
+                progress["total_upload_quota"] = int(progress.get("total_upload_quota") or 0) + upload_quota
 
     def finish_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记刷新完成。"""
@@ -1789,6 +2066,10 @@ class AccountService:
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
+        total_upload_quota = sum(
+            q for a in items
+            if a.get("status") == "正常" and (q := self._effective_upload_quota(a)) is not None
+        )
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
         by_type = {}
@@ -1803,6 +2084,7 @@ class AccountService:
             "abnormal": abnormal,
             "disabled": disabled,
             "total_quota": total_quota,
+            "total_upload_quota": total_upload_quota,
             "total_success": total_success,
             "total_fail": total_fail,
             "by_type": by_type,

@@ -1040,13 +1040,39 @@ def conversation_events(
     )
 
 
-def text_backend() -> OpenAIBackendAPI:
+def count_request_upload_files(request: ConversationRequest) -> int:
+    """统计本次请求需要上传到上游文件服务的文件/图片数量。"""
+    count = len(request.images or [])
+    for message in request.messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image" and isinstance(part.get("data"), (bytes, bytearray)):
+                    count += 1
+    return count
+
+
+def text_backend(required_upload_quota: int = 0) -> OpenAIBackendAPI:
+    if required_upload_quota > 0:
+        return OpenAIBackendAPI(access_token=account_service.get_text_access_token(required_upload_quota=required_upload_quota))
     return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
+    upload_count = count_request_upload_files(request)
     token = getattr(backend, "access_token", "")
+    if upload_count > 0:
+        # 携带文件请求按“够用且剩余上传额度最少”重新匹配账号
+        selected = account_service.get_text_access_token(required_upload_quota=upload_count)
+        if selected:
+            token = selected
+        elif token:
+            current_acct = account_service.get_account(token)
+            if current_acct is not None and not account_service._has_enough_upload_quota(current_acct, upload_count):
+                raise RuntimeError(f"no available account with upload quota >= {upload_count}")
     emitted = False
     upload_limit_retries = 0
     started_at = time.monotonic()
@@ -1088,12 +1114,19 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     # 上游流结束但未产出任何可见正文，视为失败并抛出 502，避免静默返回 HTTP 200 空内容。
                     raise RuntimeError("upstream returned empty response")
                 account_service.mark_text_used(token)
+                if upload_count > 0:
+                    account_service.consume_upload_quota(token, upload_count)
                 return
             except Exception as exc:
                 if token and not emitted and is_upload_limit_error(exc):
+                    account_service.mark_upload_rate_limited(token, reason=str(exc))
                     upload_limit_retries += 1
                     if upload_limit_retries <= TEXT_UPLOAD_LIMIT_MAX_RETRIES:
-                        next_token = account_service.get_text_access_token(attempted_tokens)
+                        next_token = (
+                            account_service.get_text_access_token(attempted_tokens, required_upload_quota=upload_count)
+                            if upload_count > 0
+                            else account_service.get_text_access_token(attempted_tokens)
+                        )
                         if next_token:
                             logger.warning({
                                 "event": "text_upload_limit_account_retry",
@@ -1779,12 +1812,16 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
-            token = account_service.get_available_access_token(
-                plan_type=plan_type,
-                source_type="codex" if codex_model else None,
-                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                deadline=request_deadline,
-            )
+            upload_count = len(request.images or [])
+            get_token_kwargs: dict[str, Any] = {
+                "plan_type": plan_type,
+                "source_type": "codex" if codex_model else None,
+                "plan_types": ("plus", "team", "pro") if codex_model and not plan_type else None,
+                "deadline": request_deadline,
+            }
+            if upload_count > 0:
+                get_token_kwargs["required_upload_quota"] = upload_count
+            token = account_service.get_available_access_token(**get_token_kwargs)
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
@@ -1842,7 +1879,10 @@ def _generate_single_image(
                         conversation_id=conv_id,
                     )
                 return outputs
-            account_service.mark_image_result(token, True)
+            if upload_count > 0:
+                account_service.mark_image_result(token, True, upload_count=upload_count)
+            else:
+                account_service.mark_image_result(token, True)
             return outputs
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False, cooldown_secs=float(config.image_timeout_retry_secs))
@@ -1936,6 +1976,8 @@ def _generate_single_image(
                 or (not upload_limited and is_image_concurrency_error(exc))
             ) else 0.0
             account_service.mark_image_result(token, False, cooldown_secs=cooldown_secs)
+            if upload_limited:
+                account_service.mark_upload_rate_limited(token, reason=str(exc))
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",

@@ -983,10 +983,9 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         else:
             yield conversation_base_event("conversation.event", state, raw=event)
 
-        if stop_on_finish and streams and all(
-            item.finished for item in streams.values() if not item.shadow
-        ):
-            # 上游已经把这条（或这些）消息标记为完成，不必再等它关连接。
+        active_streams = [item for item in streams.values() if not item.shadow]
+        if stop_on_finish and state.text and active_streams and all(item.finished for item in active_streams):
+            # 仅在已产出可见正文且所有活跃消息均完成时提前收尾，避免思考/工具消息结束或全 shadow 误触发空响应。
             yield conversation_base_event("conversation.done", state, done=True)
             break
         if not stop_on_finish and (state.file_ids or state.sediment_ids):
@@ -1085,6 +1084,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                         delta_count += 1
                         last_delta_at = time.monotonic()
                         yield delta
+                if not emitted:
+                    # 上游流结束但未产出任何可见正文，视为失败并抛出 502，避免静默返回 HTTP 200 空内容。
+                    raise RuntimeError("upstream returned empty response")
                 account_service.mark_text_used(token)
                 return
             except Exception as exc:

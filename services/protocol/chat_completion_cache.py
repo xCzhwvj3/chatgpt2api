@@ -97,6 +97,47 @@ def normalize_text_messages(messages: list[dict[str, Any]]) -> list[dict[str, An
     return normalized
 
 
+def _is_cacheable_response(value: Any) -> bool:
+    """拒绝缓存空正文响应，避免上游异常空回复在 TTL 内持续污染重试。"""
+    if not isinstance(value, dict):
+        return bool(value)
+    choices = value.get("choices")
+    if not isinstance(choices, list):
+        return bool(value)
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("content") or "") or str(message.get("refusal") or "") or message.get("tool_calls"):
+            return True
+    return False
+
+
+def _is_cacheable_stream(chunks: list[dict[str, Any]]) -> bool:
+    """仅在流式分片包含实际输出内容时写入缓存，兼容 chat.completion.chunk 与 Responses 事件。"""
+    if not chunks:
+        return False
+    has_known_event_shape = False
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        choices = chunk.get("choices")
+        if isinstance(choices, list):
+            has_known_event_shape = True
+            for choice in choices:
+                delta = choice.get("delta") if isinstance(choice, dict) else None
+                if isinstance(delta, dict) and (str(delta.get("content") or "") or str(delta.get("refusal") or "") or delta.get("tool_calls")):
+                    return True
+        event_type = str(chunk.get("type") or "")
+        if event_type:
+            has_known_event_shape = True
+            if (event_type == "response.output_text.delta" and str(chunk.get("delta") or "")) or (event_type == "response.output_text.done" and str(chunk.get("text") or "")):
+                return True
+    return not has_known_event_shape
+
+
 class ChatCompletionCache:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -165,8 +206,9 @@ class ChatCompletionCache:
 
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
-            self._prune_locked(time.time(), max_entries)
+            if _is_cacheable_response(value):
+                self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
+                self._prune_locked(time.time(), max_entries)
             self._inflight.pop(key, None)
         with inflight.condition:
             inflight.value = self._copy(value)
@@ -226,8 +268,9 @@ class ChatCompletionCache:
 
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
-            self._prune_locked(time.time(), max_entries)
+            if _is_cacheable_stream(chunks):
+                self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
+                self._prune_locked(time.time(), max_entries)
             self._inflight.pop(key, None)
         with inflight.condition:
             inflight.value = self._copy(chunks)

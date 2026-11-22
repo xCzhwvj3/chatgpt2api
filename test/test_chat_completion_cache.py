@@ -521,6 +521,62 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual([image[1] for image in images], ["image/png", "image/png", "image/png"])
         self.assertTrue(all(image[0] == PNG_1X1 for image in images))
 
+    def test_empty_chat_completion_response_is_not_cached(self) -> None:
+        calls = 0
+
+        def fake_collect_text(_backend, _request):
+            nonlocal calls
+            calls += 1
+            return "" if calls == 1 else "recovered"
+
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "describe image"}],
+        }
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+        ):
+            first = openai_v1_chat_complete.handle(body)
+            second = openai_v1_chat_complete.handle(body)
+            third = openai_v1_chat_complete.handle(body)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(first["choices"][0]["message"]["content"], "")
+        self.assertEqual(second["choices"][0]["message"]["content"], "recovered")
+        self.assertEqual(third["choices"][0]["message"]["content"], "recovered")
+
+    def test_empty_chat_completion_stream_is_not_cached(self) -> None:
+        calls = 0
+
+        def fake_stream_text_deltas(_backend, _request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return iter([])
+            return iter(["recovered"])
+
+        body = {
+            "model": "auto",
+            "stream": True,
+            "messages": [{"role": "user", "content": "describe image stream"}],
+        }
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch(
+                "services.protocol.openai_v1_chat_complete.stream_text_deltas",
+                side_effect=fake_stream_text_deltas,
+            ),
+        ):
+            first = list(openai_v1_chat_complete.handle(body))
+            second = list(openai_v1_chat_complete.handle(body))
+            third = list(openai_v1_chat_complete.handle(body))
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(openai_v1_chat_complete.collect_chat_content(first), "")
+        self.assertEqual(openai_v1_chat_complete.collect_chat_content(second), "recovered")
+        self.assertEqual(openai_v1_chat_complete.collect_chat_content(third), "recovered")
+
 
 if __name__ == "__main__":
     unittest.main()

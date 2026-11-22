@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 
 from services.config import config
 from services.protocol.conversation import (
+    ConversationRequest,
     conversation_events,
     iter_conversation_payloads,
     normalize_messages,
+    stream_text_deltas,
 )
 
 
@@ -166,6 +169,46 @@ class StreamTextDedupTests(unittest.TestCase):
         text = "".join(str(event.get("delta") or "") for event in events if event.get("type") == "conversation.delta")
         self.assertEqual(text, "第一段。")
         self.assertEqual(sum(1 for event in events if event.get("type") == "conversation.done"), 1)
+
+    def test_stop_on_finish_waits_past_empty_finished_message(self) -> None:
+        thought_finished = json.dumps({"o": "add", "v": {"message": {
+            "id": "m-thought",
+            "author": {"role": "assistant"},
+            "status": "finished_successfully",
+            "content": {"content_type": "thoughts", "thoughts": [{"summary": "thinking"}]},
+        }}})
+        answer_finished = json.dumps({"o": "add", "v": {"message": {
+            "id": "m-answer",
+            "author": {"role": "assistant"},
+            "status": "finished_successfully",
+            "content": {"content_type": "text", "parts": ["真正回答。"]},
+        }}})
+        payloads = [thought_finished, answer_finished, message_event("不该被读到", "m-answer")]
+
+        events = list(iter_conversation_payloads(iter(payloads), stop_on_finish=True))
+        text = "".join(str(event.get("delta") or "") for event in events if event.get("type") == "conversation.delta")
+        self.assertEqual(text, "真正回答。")
+        self.assertEqual(sum(1 for event in events if event.get("type") == "conversation.done"), 1)
+
+    def test_stream_text_deltas_raises_on_empty_upstream_stream(self) -> None:
+        class FakeParentBackend:
+            access_token = "token-1"
+
+        class FakeActiveBackend:
+            def __init__(self, access_token: str = ""):
+                self.access_token = access_token
+
+            def close(self) -> None:
+                pass
+
+        with (
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeActiveBackend),
+            mock.patch("services.protocol.conversation.conversation_events", return_value=iter([{"type": "conversation.done", "done": True}])),
+            mock.patch("services.protocol.conversation.account_service.mark_text_used") as mark_used,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "empty response"):
+                list(stream_text_deltas(FakeParentBackend(), ConversationRequest(prompt="hello", model="auto")))
+        mark_used.assert_not_called()
 
     def test_history_replay_is_skipped(self) -> None:
         previous = "上一轮的回答。"

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import os
 from threading import Event
 
+from anyio import to_thread
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -20,11 +23,15 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # 调大默认 AnyIO 线程池上限，避免长耗时流式/生图请求占满默认 40 线程饿死其他接口
+        raw_tokens = str(os.getenv("CHATGPT2API_THREADPOOL_TOKENS", "200") or "200").strip()
+        target_tokens = int(raw_tokens) if raw_tokens.isdigit() else 200
+        to_thread.current_default_thread_limiter().total_tokens = max(40, target_tokens)
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
-        config.cleanup_old_images()
+        await run_in_threadpool(config.cleanup_old_images)
         try:
             yield
         finally:
@@ -48,7 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(system.create_router(app_version))
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
-    async def serve_web(full_path: str):
+    def serve_web(full_path: str):
         asset = resolve_web_asset(full_path)
         if asset is not None:
             return FileResponse(asset)

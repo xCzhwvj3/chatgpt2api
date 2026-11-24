@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Iterator
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -21,19 +23,27 @@ from utils.helper import UPLOAD_LIMIT_MESSAGE, anthropic_sse_stream, is_upload_l
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+# 日志文件超过 10 MB 时自动截断为最新 5000 条，避免长期运行后无限膨胀拖慢读写
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_KEEP_LINES = 5000
+LOG_TRIM_CHECK_INTERVAL = 100
+LOG_READ_CHUNK_BYTES = 64 * 1024
 
 
 class LogService:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
+        # 启动后首次写入即检查一次体积，便于平滑收缩存量超大日志文件
+        self._writes_since_trim_check = LOG_TRIM_CHECK_INTERVAL
 
     @staticmethod
-    def _legacy_id(raw_line: str, line_number: int) -> str:
-        payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
+    def _legacy_id(raw_line: str) -> str:
+        payload = raw_line.encode("utf-8", errors="ignore")
         return hashlib.sha1(payload).hexdigest()[:24]
 
-    def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
+    def _parse_line(self, raw_line: str) -> dict[str, Any] | None:
         try:
             item = json.loads(raw_line)
         except Exception:
@@ -41,12 +51,52 @@ class LogService:
         if not isinstance(item, dict):
             return None
         parsed = dict(item)
-        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line, line_number))
+        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line))
         return parsed
 
     @staticmethod
     def _serialize_item(item: dict[str, Any]) -> str:
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+
+    def _iter_lines_reverse(self) -> Iterator[str]:
+        """从文件末尾按 64 KiB 分块倒序读取日志行，避免全量读入内存。"""
+        try:
+            file_handle = self.path.open("rb")
+        except FileNotFoundError:
+            return
+        with file_handle as file:
+            pos = file.seek(0, os.SEEK_END)
+            carry = b""
+            while pos > 0:
+                read_size = min(LOG_READ_CHUNK_BYTES, pos)
+                pos -= read_size
+                file.seek(pos)
+                chunk = file.read(read_size)
+                parts = (chunk + carry).split(b"\n")
+                carry = parts[0]
+                for raw_bytes in reversed(parts[1:]):
+                    if raw_bytes:
+                        yield raw_bytes.decode("utf-8", errors="replace")
+            if carry:
+                yield carry.decode("utf-8", errors="replace")
+
+    def _trim_if_needed_locked(self) -> None:
+        """在写锁保护下检查日志体积，超限时原子保留最近 LOG_KEEP_LINES 条记录。"""
+        try:
+            if not self.path.exists() or self.path.stat().st_size <= LOG_MAX_BYTES:
+                return
+        except OSError:
+            return
+        kept_reversed: list[str] = []
+        for raw_line in self._iter_lines_reverse():
+            kept_reversed.append(raw_line)
+            if len(kept_reversed) >= LOG_KEEP_LINES:
+                break
+        kept_reversed.reverse()
+        tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.trim.tmp")
+        content = "\n".join(kept_reversed) + ("\n" if kept_reversed else "")
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, self.path)
 
     @staticmethod
     def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
@@ -68,16 +118,21 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+        line = self._serialize_item(item) + "\n"
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(line)
+            self._writes_since_trim_check += 1
+            if self._writes_since_trim_check >= LOG_TRIM_CHECK_INTERVAL:
+                self._writes_since_trim_check = 0
+                self._trim_if_needed_locked()
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
+        for raw_line in self._iter_lines_reverse():
+            item = self._parse_line(raw_line)
             if item is None:
                 continue
             if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
@@ -91,23 +146,26 @@ class LogService:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
-        removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
-        return {"removed": removed}
+        with self._lock:
+            if not self.path.exists():
+                return {"removed": 0}
+            removed = 0
+            tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.delete.tmp")
+            with self.path.open("r", encoding="utf-8", errors="replace") as src, tmp_path.open("w", encoding="utf-8") as dst:
+                for line in src:
+                    raw_line = line.rstrip("\r\n")
+                    if not raw_line:
+                        continue
+                    item = self._parse_line(raw_line)
+                    if item is None:
+                        dst.write(raw_line + "\n")
+                        continue
+                    if str(item.get("id") or "") in target_ids:
+                        removed += 1
+                        continue
+                    dst.write(self._serialize_item(item) + "\n")
+            os.replace(tmp_path, self.path)
+            return {"removed": removed}
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")
@@ -246,20 +304,20 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+            await self.alog("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                            conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            await self.alog("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            await self.alog("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
-            self.log("调用完成", result)
+            await self.alog("调用完成", result)
             response = dict(result)
             response.pop("_account_email", None)
             return response
@@ -268,19 +326,19 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+            await self.alog("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                            conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            await self.alog("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            await self.alog("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
-            self.log("流式调用结束")
+            await self.alog("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
 
@@ -314,6 +372,28 @@ class LoggedCall:
             if not failed:
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "")
+
+    async def alog(
+        self,
+        suffix: str,
+        result: object = None,
+        status: str = "success",
+        error: str = "",
+        urls: list[str] | None = None,
+        account_email: str = "",
+        conversation_id: str = "",
+    ) -> None:
+        """在线程池中异步写入调用日志，避免磁盘 I/O 与文件截断阻塞事件循环。"""
+        await run_in_threadpool(
+            self.log,
+            suffix,
+            result,
+            status,
+            error,
+            urls,
+            account_email,
+            conversation_id,
+        )
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:

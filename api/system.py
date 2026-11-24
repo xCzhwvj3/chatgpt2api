@@ -78,12 +78,12 @@ def create_router(app_version: str) -> APIRouter:
         return {"version": app_version}
 
     @router.get("/api/settings")
-    async def get_settings(authorization: str | None = Header(default=None)):
+    def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"config": config.get()}
 
     @router.post("/api/settings")
-    async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
+    def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
             return {"config": config.update(body.model_dump(mode="python"))}
@@ -91,7 +91,7 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/image-models")
-    async def get_image_models(authorization: str | None = Header(default=None)):
+    def get_image_models(authorization: str | None = Header(default=None)):
         require_identity(authorization)
         return get_image_model_catalog()
 
@@ -101,25 +101,25 @@ def create_router(app_version: str) -> APIRouter:
         return await run_in_threadpool(refresh_image_model_catalog)
 
     @router.get("/api/images")
-    async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
-    async def get_image(image_path: str):
+    def get_image(image_path: str):
         return get_image_response(image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
-    async def get_image_thumbnail(image_path: str):
+    def get_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
 
     @router.post("/api/images/delete")
-    async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
+    def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return delete_images(body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
 
     @router.post("/api/images/download")
-    async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
+    def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         buf = download_images_zip(body.paths)
         return StreamingResponse(
@@ -129,17 +129,17 @@ def create_router(app_version: str) -> APIRouter:
         )
 
     @router.get("/api/images/download/{image_path:path}")
-    async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
+    def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return get_image_download_response(image_path)
 
     @router.get("/api/logs")
-    async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
 
     @router.post("/api/logs/delete")
-    async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
+    def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return log_service.delete(body.ids)
 
@@ -149,7 +149,7 @@ def create_router(app_version: str) -> APIRouter:
         return {"result": await run_in_threadpool(test_proxy, (body.url or "").strip())}
 
     @router.get("/api/proxy/runtime")
-    async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
+    def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {
             "runtime": config.get_public_proxy_runtime_settings(),
@@ -157,7 +157,7 @@ def create_router(app_version: str) -> APIRouter:
         }
 
     @router.post("/api/proxy/runtime")
-    async def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
+    def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
             config.update({"proxy_runtime": body.model_dump(mode="python")})
@@ -174,7 +174,7 @@ def create_router(app_version: str) -> APIRouter:
         return {"result": await run_in_threadpool(test_clearance, body.target_url)}
 
     @router.get("/api/storage/info")
-    async def get_storage_info(authorization: str | None = Header(default=None)):
+    def get_storage_info(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         storage = config.get_storage_backend()
         return {
@@ -204,11 +204,11 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/backups")
-    async def get_backups(authorization: str | None = Header(default=None)):
+    def get_backups(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
             return {
-                "items": await run_in_threadpool(backup_service.list_backups),
+                "items": backup_service.list_backups(),
                 "state": backup_service.get_status(),
                 "settings": backup_service.get_settings(),
             }
@@ -261,12 +261,12 @@ def create_router(app_version: str) -> APIRouter:
 
 
     @router.get("/api/images/tags")
-    async def list_image_tags(authorization: str | None = Header(default=None)):
+    def list_image_tags(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"tags": get_all_tags()}
 
     @router.post("/api/images/tags")
-    async def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
+    def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         rel = body.path.strip().lstrip("/")
         if not rel:
@@ -275,13 +275,13 @@ def create_router(app_version: str) -> APIRouter:
         return {"ok": True, "tags": tags}
 
     @router.delete("/api/images/tags/{tag}")
-    async def delete_image_tag(tag: str, authorization: str | None = Header(default=None)):
+    def delete_image_tag(tag: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         count = delete_tag(tag)
         return {"ok": True, "removed_from": count}
 
     @router.get("/api/images/storage")
-    async def get_image_storage(authorization: str | None = Header(default=None)):
+    def get_image_storage(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return storage_stats()
 
@@ -300,7 +300,7 @@ def create_router(app_version: str) -> APIRouter:
         return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
 
     @router.get("/health", response_model=None)
-    async def health_dashboard(format: str = Query(default="html")):
+    def health_dashboard(format: str = Query(default="html")):
         from services.account_service import account_service as acct_svc
         stats = acct_svc.get_stats()
         storage = config.get_storage_backend()

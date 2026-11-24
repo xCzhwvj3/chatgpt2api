@@ -1063,7 +1063,13 @@ def text_backend(required_upload_quota: int = 0) -> OpenAIBackendAPI:
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
     upload_count = count_request_upload_files(request)
-    token = getattr(backend, "access_token", "")
+    initial_token = getattr(backend, "access_token", "")
+    token = initial_token
+    can_reuse_initial = (
+        type(backend) is OpenAIBackendAPI
+        and getattr(backend, "session", None) is not None
+        and not getattr(backend, "_closed", False)
+    )
     if upload_count > 0:
         # 携带文件请求按“够用且剩余上传额度最少”重新匹配账号
         selected = account_service.get_text_access_token(required_upload_quota=upload_count)
@@ -1072,7 +1078,12 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         elif token:
             current_acct = account_service.get_account(token)
             if current_acct is not None and not account_service._has_enough_upload_quota(current_acct, upload_count):
+                if can_reuse_initial:
+                    backend.close()
                 raise RuntimeError(f"no available account with upload quota >= {upload_count}")
+    if can_reuse_initial and token != initial_token:
+        backend.close()
+        can_reuse_initial = False
     emitted = False
     upload_limit_retries = 0
     started_at = time.monotonic()
@@ -1093,7 +1104,11 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 attempted_tokens.add(token)
             active_backend = None
             try:
-                active_backend = OpenAIBackendAPI(access_token=token)
+                if can_reuse_initial and token == initial_token and not getattr(backend, "_closed", False):
+                    active_backend = backend
+                    can_reuse_initial = False
+                else:
+                    active_backend = OpenAIBackendAPI(access_token=token)
                 active_backend.request_deadline = request_deadline
                 for event in conversation_events(
                     active_backend,
@@ -1166,6 +1181,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             backend.request_deadline = previous_deadline
         elif hasattr(backend, "request_deadline"):
             delattr(backend, "request_deadline")
+        if type(backend) is OpenAIBackendAPI and getattr(backend, "session", None) is not None:
+            backend.close()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:

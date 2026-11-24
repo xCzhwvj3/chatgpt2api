@@ -234,6 +234,66 @@ class RequestDeadlineTests(unittest.TestCase):
         self.assertEqual(download_url, "https://download.test/deck.pptx")
         self.assertEqual(backend.session.get.call_args.kwargs["timeout"], 5.0)
 
+    def test_session_pool_reuses_clean_session_and_discards_tainted_session(self) -> None:
+        from services.openai_backend_api import _SESSION_POOL, _checkin_session, _checkout_session
+
+        _SESSION_POOL.clear()
+        try:
+            key1, first = _checkout_session({"proxy": "http://127.0.0.1:8118", "impersonate": "edge101", "verify": True})
+            first.headers["Authorization"] = "Bearer secret-1"
+            first.cookies.set("__cf_bm", "cookie-1", domain="chatgpt.com")
+            _checkin_session(key1, first)
+
+            key2, second = _checkout_session({"proxy": "http://127.0.0.1:8118", "impersonate": "edge101", "verify": True})
+            self.assertIs(second, first)
+            self.assertNotIn("Authorization", second.headers)
+            self.assertEqual(len(list(second.cookies)), 0)
+
+            second._tainted = True
+            _checkin_session(key2, second)
+            self.assertTrue(getattr(second, "_closed", False))
+
+            key3, third = _checkout_session({"proxy": "http://127.0.0.1:8118", "impersonate": "edge101", "verify": True})
+            self.assertIsNot(third, second)
+            _checkin_session(key3, third)
+        finally:
+            for bucket in list(_SESSION_POOL.values()):
+                while bucket:
+                    _, sess = bucket.pop()
+                    sess.close()
+            _SESSION_POOL.clear()
+
+    def test_stream_text_deltas_reuses_initialized_backend_on_first_attempt(self) -> None:
+        from services.openai_backend_api import _SESSION_POOL
+
+        _SESSION_POOL.clear()
+        try:
+            with mock.patch("services.openai_backend_api.account_service.get_account", return_value={}):
+                initial_backend = OpenAIBackendAPI(access_token="token-1")
+            initial_session = initial_backend.session
+            seen_backends: list[OpenAIBackendAPI] = []
+
+            def fake_events(active_backend: OpenAIBackendAPI, **_kwargs):
+                seen_backends.append(active_backend)
+                yield {"type": "conversation.delta", "delta": "hello"}
+
+            with (
+                mock.patch("services.protocol.conversation.conversation_events", side_effect=fake_events),
+                mock.patch("services.protocol.conversation.account_service.mark_text_used"),
+            ):
+                chunks = list(stream_text_deltas(initial_backend, ConversationRequest(prompt="hi", model="gpt-5")))
+
+            self.assertEqual(chunks, ["hello"])
+            self.assertEqual(seen_backends, [initial_backend])
+            self.assertTrue(getattr(initial_backend, "_closed", False))
+            self.assertFalse(getattr(initial_session, "_closed", False))
+        finally:
+            for bucket in list(_SESSION_POOL.values()):
+                while bucket:
+                    _, sess = bucket.pop()
+                    sess.close()
+            _SESSION_POOL.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

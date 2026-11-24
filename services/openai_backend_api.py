@@ -9,6 +9,7 @@ import time
 
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -175,6 +176,109 @@ class EditableFileExportResult:
     zip_path: Path
 
 
+_SessionPoolKey = tuple[str, str, bool]
+_SESSION_POOL: dict[_SessionPoolKey, deque[tuple[float, requests.Session]]] = {}
+_SESSION_POOL_LOCK = threading.Lock()
+_SESSION_POOL_MAX_PER_KEY = 32
+_SESSION_POOL_IDLE_TTL_SECS = 240.0
+
+
+class _PooledSession(requests.Session):
+    """池化 curl_cffi Session：禁用线程局部句柄以支持跨工作线程借还复用，并在异常或风控状态码时标记淘汰。"""
+
+    def __init__(self, reset_status_codes: tuple[int, ...] = (403,), **kwargs: Any) -> None:
+        super().__init__(use_thread_local_curl=False, **kwargs)
+        self._tainted = False
+        self._reset_status_codes = reset_status_codes
+
+    def request(self, method: Any, url: str, **kwargs: Any) -> Any:
+        try:
+            response = super().request(method=method, url=url, **kwargs)
+        except BaseException:
+            self._tainted = True
+            raise
+        if response.status_code in self._reset_status_codes:
+            self._tainted = True
+        return response
+
+
+def _destroy_session(session: Any) -> None:
+    """销毁不可复用的 Session 及其懒加载的流式线程池，避免句柄与线程泄漏。"""
+    executor = getattr(session, "_executor", None)
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    try:
+        session.close()
+    except Exception:
+        pass
+
+
+def _checkout_session(
+    session_kwargs: dict[str, Any],
+    reset_status_codes: tuple[int, ...] = (403,),
+) -> tuple[_SessionPoolKey | None, Any]:
+    """按代理、TLS 指纹与证书校验配置借出热连接，借出前清空旧 Cookie 与请求头防串号。"""
+    if not isinstance(requests.Session, type):
+        return None, requests.Session(**session_kwargs)
+    pool_key: _SessionPoolKey = (
+        str(session_kwargs.get("proxy") or ""),
+        str(session_kwargs.get("impersonate") or ""),
+        bool(session_kwargs.get("verify", True)),
+    )
+    now = time.monotonic()
+    reused: _PooledSession | None = None
+    expired: list[Any] = []
+    with _SESSION_POOL_LOCK:
+        bucket = _SESSION_POOL.get(pool_key)
+        while bucket:
+            idle_since, candidate = bucket.pop()
+            if (
+                isinstance(candidate, _PooledSession)
+                and not getattr(candidate, "_closed", False)
+                and now - idle_since <= _SESSION_POOL_IDLE_TTL_SECS
+            ):
+                reused = candidate
+                break
+            expired.append(candidate)
+    for stale in expired:
+        _destroy_session(stale)
+    if reused is not None:
+        reused._tainted = False
+        reused._reset_status_codes = reset_status_codes
+        reused.cookies.clear()
+        reused.headers.clear()
+        return pool_key, reused
+    return pool_key, _PooledSession(reset_status_codes=reset_status_codes, **session_kwargs)
+
+
+def _checkin_session(pool_key: _SessionPoolKey | None, session: Any) -> None:
+    """归还健康 Session 至连接池栈顶；若已受损、关闭或超出容量上限则直接销毁。"""
+    if session is None:
+        return
+    if (
+        pool_key is None
+        or not isinstance(session, _PooledSession)
+        or getattr(session, "_closed", False)
+        or getattr(session, "_tainted", False)
+    ):
+        _destroy_session(session)
+        return
+    session.cookies.clear()
+    session.headers.clear()
+    overflow = False
+    with _SESSION_POOL_LOCK:
+        bucket = _SESSION_POOL.setdefault(pool_key, deque())
+        if len(bucket) < _SESSION_POOL_MAX_PER_KEY:
+            bucket.append((time.monotonic(), session))
+        else:
+            overflow = True
+    if overflow:
+        _destroy_session(session)
+
+
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -206,11 +310,19 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self._session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
-        ))
+        )
+        self._reset_status_codes = proxy_settings.get_profile(
+            account=self.account,
+            upstream=True,
+        ).reset_session_status_codes
+        self._session_pool_key, self.session = _checkout_session(
+            self._session_kwargs,
+            self._reset_status_codes,
+        )
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -366,9 +478,12 @@ class OpenAIBackendAPI:
             return
         self._closed = True
         session = getattr(self, "session", None)
+        self.session = None
         if session:
             try:
-                session.close()
+                self._closed_headers = dict(session.headers)
+                if _checkin_session is not None:
+                    _checkin_session(getattr(self, "_session_pool_key", None), session)
             except Exception:
                 pass
 
@@ -413,7 +528,11 @@ class OpenAIBackendAPI:
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
-        headers = dict(self.session.headers)
+        headers = (
+            dict(self.session.headers)
+            if getattr(self, "session", None) is not None
+            else dict(getattr(self, "_closed_headers", ()))
+        )
         headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
         account = getattr(self, "account", None)
@@ -442,16 +561,18 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
+    def _get_me(self, session: Optional[requests.Session] = None) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        active_session = session or self.session
+        response = active_session.get(self.base_url + path, headers=self._headers(path), timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_conversation_init(self) -> Dict[str, Any]:
+    def _get_conversation_init(self, session: Optional[requests.Session] = None) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
-        response = self.session.post(
+        active_session = session or self.session
+        response = active_session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json"}),
             json={
@@ -466,10 +587,14 @@ class OpenAIBackendAPI:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_default_account(self) -> Dict[str, Any]:
+    def _get_default_account(self, session: Optional[requests.Session] = None) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+        active_session = session or self.session
+        response = active_session.get(
+            self.base_url + path + "?timezone_offset_min=-480",
+            headers=self._headers(path),
+            timeout=20,
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -489,11 +614,23 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
+        use_pool = isinstance(getattr(self, "session", None), _PooledSession)
+
+        def _call_isolated(fn: Callable[..., Dict[str, Any]]) -> Dict[str, Any]:
+            if not use_pool:
+                return fn()
+            # 并发子任务各自独立借还连接，避免多线程共享同一 libcurl 句柄或主线程提前退出时争用
+            pool_key, worker_session = _checkout_session(self._session_kwargs, self._reset_status_codes)
+            try:
+                return fn(worker_session)
+            finally:
+                _checkin_session(pool_key, worker_session)
+
         executor = ThreadPoolExecutor(max_workers=3)
         try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
+            me_future = executor.submit(_call_isolated, self._get_me)
+            init_future = executor.submit(_call_isolated, self._get_conversation_init)
+            account_future = executor.submit(_call_isolated, self._get_default_account)
             me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)

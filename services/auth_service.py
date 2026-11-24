@@ -5,7 +5,7 @@ import hmac
 import secrets
 import uuid
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Lock, Thread
 from typing import Literal
 
 from services.config import config
@@ -26,6 +26,7 @@ class AuthService:
     def __init__(self, storage: StorageBackend):
         self.storage = storage
         self._lock = Lock()
+        self._persist_lock = Lock()
         self._items = self._load()
         self._last_used_flush_at: dict[str, datetime] = {}
 
@@ -71,6 +72,16 @@ class AuthService:
 
     def _save(self) -> None:
         self.storage.save_auth_keys(self._items)
+
+    def _flush_snapshot(self) -> None:
+        """在独立写锁下安全刷盘当前密钥快照，避免鉴权热路径阻塞事件循环。"""
+        with self._persist_lock:
+            with self._lock:
+                snapshot = [dict(item) for item in self._items]
+            try:
+                self.storage.save_auth_keys(snapshot)
+            except Exception:
+                pass
 
     def _reload_locked(self) -> None:
         self._items = self._load()
@@ -148,27 +159,29 @@ class AuthService:
         return candidate
 
     def create_key(self, *, role: AuthRole, name: str = "") -> tuple[dict[str, object], str]:
-        with self._lock:
-            self._reload_locked()
-            normalized_name = self._build_name_locked(name, role=role)
-            while True:
-                raw_key = f"sk-{secrets.token_urlsafe(24)}"
-                try:
-                    key_hash = self._build_key_hash_locked(raw_key)
-                    break
-                except ValueError:
-                    continue
-            item = {
-                "id": uuid.uuid4().hex[:12],
-                "name": normalized_name,
-                "role": role,
-                "key_hash": key_hash,
-                "enabled": True,
-                "created_at": _now_iso(),
-                "last_used_at": None,
-            }
-            self._items.append(item)
-            self._save()
+        with self._persist_lock:
+            with self._lock:
+                self._reload_locked()
+                normalized_name = self._build_name_locked(name, role=role)
+                while True:
+                    raw_key = f"sk-{secrets.token_urlsafe(24)}"
+                    try:
+                        key_hash = self._build_key_hash_locked(raw_key)
+                        break
+                    except ValueError:
+                        continue
+                item = {
+                    "id": uuid.uuid4().hex[:12],
+                    "name": normalized_name,
+                    "role": role,
+                    "key_hash": key_hash,
+                    "enabled": True,
+                    "created_at": _now_iso(),
+                    "last_used_at": None,
+                }
+                self._items.append(item)
+                snapshot = [dict(entry) for entry in self._items]
+            self.storage.save_auth_keys(snapshot)
             return self._public_item(item), raw_key
 
     def update_key(
@@ -181,45 +194,53 @@ class AuthService:
         normalized_id = self._clean(key_id)
         if not normalized_id:
             return None
-        with self._lock:
-            self._reload_locked()
-            for index, item in enumerate(self._items):
-                if item.get("id") != normalized_id:
-                    continue
-                if role is not None and item.get("role") != role:
-                    return None
-                next_item = dict(item)
-                next_role = "admin" if str(next_item.get("role") or "").strip().lower() == "admin" else "user"
-                if "name" in updates and updates.get("name") is not None:
-                    next_item["name"] = self._build_name_locked(
-                        str(updates.get("name") or ""),
-                        role=next_role,
-                        exclude_id=normalized_id,
-                    )
-                if "enabled" in updates and updates.get("enabled") is not None:
-                    next_item["enabled"] = bool(updates.get("enabled"))
-                if "key" in updates and updates.get("key") is not None:
-                    next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
-                self._items[index] = next_item
-                self._save()
-                return self._public_item(next_item)
-        return None
+        with self._persist_lock:
+            updated_item: dict[str, object] | None = None
+            snapshot: list[dict[str, object]] | None = None
+            with self._lock:
+                self._reload_locked()
+                for index, item in enumerate(self._items):
+                    if item.get("id") != normalized_id:
+                        continue
+                    if role is not None and item.get("role") != role:
+                        return None
+                    next_item = dict(item)
+                    next_role = "admin" if str(next_item.get("role") or "").strip().lower() == "admin" else "user"
+                    if "name" in updates and updates.get("name") is not None:
+                        next_item["name"] = self._build_name_locked(
+                            str(updates.get("name") or ""),
+                            role=next_role,
+                            exclude_id=normalized_id,
+                        )
+                    if "enabled" in updates and updates.get("enabled") is not None:
+                        next_item["enabled"] = bool(updates.get("enabled"))
+                    if "key" in updates and updates.get("key") is not None:
+                        next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
+                    self._items[index] = next_item
+                    updated_item = self._public_item(next_item)
+                    snapshot = [dict(entry) for entry in self._items]
+                    break
+            if snapshot is not None:
+                self.storage.save_auth_keys(snapshot)
+            return updated_item
 
     def delete_key(self, key_id: str, *, role: AuthRole | None = None) -> bool:
         normalized_id = self._clean(key_id)
         if not normalized_id:
             return False
-        with self._lock:
-            self._reload_locked()
-            before = len(self._items)
-            self._items = [
-                item
-                for item in self._items
-                if not (item.get("id") == normalized_id and (role is None or item.get("role") == role))
-            ]
-            if len(self._items) == before:
-                return False
-            self._save()
+        with self._persist_lock:
+            with self._lock:
+                self._reload_locked()
+                before = len(self._items)
+                self._items = [
+                    item
+                    for item in self._items
+                    if not (item.get("id") == normalized_id and (role is None or item.get("role") == role))
+                ]
+                if len(self._items) == before:
+                    return False
+                snapshot = [dict(entry) for entry in self._items]
+            self.storage.save_auth_keys(snapshot)
             return True
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
@@ -227,6 +248,8 @@ class AuthService:
         if not candidate:
             return None
         candidate_hash = _hash_key(candidate)
+        matched_item: dict[str, object] | None = None
+        should_flush = False
         with self._lock:
             for index, item in enumerate(self._items):
                 if not bool(item.get("enabled", True)):
@@ -241,13 +264,13 @@ class AuthService:
                 item_id = self._clean(next_item.get("id"))
                 last_flush_at = self._last_used_flush_at.get(item_id)
                 if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
-                    try:
-                        self._save()
-                        self._last_used_flush_at[item_id] = now
-                    except Exception:
-                        pass
-                return self._public_item(next_item)
-        return None
+                    self._last_used_flush_at[item_id] = now
+                    should_flush = True
+                matched_item = self._public_item(next_item)
+                break
+        if should_flush:
+            Thread(target=self._flush_snapshot, name="auth-last-used-flush", daemon=True).start()
+        return matched_item
 
 
 auth_service = AuthService(config.get_storage_backend())

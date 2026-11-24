@@ -1679,6 +1679,9 @@ def stream_image_outputs(
                     })
                     _sleep_image_retry(backend, backoff)
                     continue
+                # 兜底轮询仍超时且未拿到任何图片资产时，抛出超时异常交由外层换号重试
+                if isinstance(exc, ImagePollTimeoutError) and not file_ids and not sediment_ids:
+                    raise
                 # 超时错误或重试次数用尽，停止重试
                 break
         
@@ -1797,7 +1800,10 @@ def _generate_single_image(
     concurrency_retry_count = 0
     upload_limit_retry_count = 0
     account_email = ""
-    request_deadline = time.monotonic() + float(config.image_poll_timeout_secs)
+    total_timeout_secs = float(config.image_poll_timeout_secs)
+    request_deadline = time.monotonic() + total_timeout_secs
+    failed_tokens: set[str] = set()
+    last_retryable_exc: Exception | None = None
 
     while True:
         remaining_before_attempt = request_deadline - time.monotonic()
@@ -1819,10 +1825,15 @@ def _generate_single_image(
                 "plan_types": ("plus", "team", "pro") if codex_model and not plan_type else None,
                 "deadline": request_deadline,
             }
+            if failed_tokens:
+                get_token_kwargs["excluded_tokens"] = failed_tokens
             if upload_count > 0:
                 get_token_kwargs["required_upload_quota"] = upload_count
             token = account_service.get_available_access_token(**get_token_kwargs)
         except RuntimeError as exc:
+            # 已排除故障账号后若无其他可用候选，优先抛出上次实际失败原因，避免误报 429 额度不足
+            if last_retryable_exc is not None:
+                raise last_retryable_exc from exc
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         emitted_for_token = False
@@ -1840,7 +1851,21 @@ def _generate_single_image(
         backend = None
         try:
             backend = OpenAIBackendAPI(access_token=token)
-            backend.image_request_deadline = request_deadline
+            # 总预算充足且号池存在其他候选账号时，限制单次尝试超时上限，确保单号卡死后仍有余量切号重试
+            attempt_deadline = request_deadline
+            now_mono = time.monotonic()
+            remaining_budget = request_deadline - now_mono
+            if total_timeout_secs >= 75.0:
+                per_attempt_secs = min(65.0, max(45.0, total_timeout_secs / 2.0))
+                if remaining_budget - per_attempt_secs >= 35.0 and account_service.has_ready_image_account(
+                    excluded_tokens=failed_tokens | {token},
+                    plan_type=plan_type,
+                    source_type="codex" if codex_model else None,
+                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                    required_upload_quota=upload_count,
+                ):
+                    attempt_deadline = now_mono + per_attempt_secs
+            backend.image_request_deadline = attempt_deadline
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1886,6 +1911,8 @@ def _generate_single_image(
             return outputs
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False, cooldown_secs=float(config.image_timeout_retry_secs))
+            failed_tokens.add(token)
+            last_retryable_exc = exc
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1911,7 +1938,8 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            # 提示词触发内容策略属于输入问题，不计入账号连续失败熔断
+            account_service.mark_image_result(token, False, penalize=False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1928,14 +1956,17 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            is_policy_violation = getattr(exc, "code", "") == "content_policy_violation"
+            account_service.mark_image_result(token, False, penalize=not is_policy_violation)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+                failed_tokens.add(token)
+                last_retryable_exc = exc
                 text_reply_retry_count += 1
-                if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
+                if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES and request_deadline > time.monotonic():
                     logger.warning({
                         "event": "image_model_text_reply_retry",
                         "request_token": token,
@@ -1987,6 +2018,15 @@ def _generate_single_image(
                 "index": index,
             })
             if not emitted_for_token and upload_limited:
+                failed_tokens.add(token)
+                upload_limit_exc = ImageGenerationError(
+                    UPLOAD_LIMIT_MESSAGE,
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    code="upload_limit_exceeded",
+                    account_email=account_email,
+                )
+                last_retryable_exc = upload_limit_exc
                 upload_limit_retry_count += 1
                 if upload_limit_retry_count <= MAX_UPLOAD_LIMIT_RETRIES and request_deadline > time.monotonic():
                     logger.warning({
@@ -1996,14 +2036,10 @@ def _generate_single_image(
                         "index": index,
                     })
                     continue
-                raise ImageGenerationError(
-                    UPLOAD_LIMIT_MESSAGE,
-                    status_code=429,
-                    error_type="rate_limit_error",
-                    code="upload_limit_exceeded",
-                    account_email=account_email,
-                ) from exc
+                raise upload_limit_exc from exc
             if not emitted_for_token and isinstance(exc, ImageStreamHardTimeoutError):
+                failed_tokens.add(token)
+                last_retryable_exc = exc
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES and request_deadline > time.monotonic():
                     logger.warning({
@@ -2016,6 +2052,8 @@ def _generate_single_image(
                     })
                     continue
             if not emitted_for_token and is_image_concurrency_error(exc):
+                failed_tokens.add(token)
+                last_retryable_exc = exc
                 concurrency_retry_count += 1
                 if concurrency_retry_count <= MAX_CONCURRENCY_RETRIES and request_deadline > time.monotonic():
                     wait_secs = min(float(config.image_timeout_retry_secs), 10.0)
@@ -2036,6 +2074,7 @@ def _generate_single_image(
                     token = refreshed_token
                     continue
                 account_service.remove_invalid_token(token, "image_stream")
+                failed_tokens.add(token)
                 continue
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):

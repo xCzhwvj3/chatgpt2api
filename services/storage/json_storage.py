@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +31,13 @@ class JSONStorageBackend(StorageBackend):
     @staticmethod
     def _save_json_list(file_path: Path, items: list[dict[str, Any]]) -> None:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(
+        # 使用临时文件 + 原子替换，防止并发读或进程中断导致 JSON 文件截断损坏
+        tmp_path = file_path.with_name(f".{file_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp_path.write_text(
             json.dumps(items, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        os.replace(tmp_path, file_path)
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从 JSON 文件加载账号数据"""
@@ -57,10 +62,14 @@ class JSONStorageBackend(StorageBackend):
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到 JSON 文件"""
         self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
-        self.auth_keys_path.write_text(
+        tmp_path = self.auth_keys_path.with_name(
+            f".{self.auth_keys_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        tmp_path.write_text(
             json.dumps({"items": auth_keys}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        os.replace(tmp_path, self.auth_keys_path)
 
     def health_check(self) -> dict[str, Any]:
         """健康检查"""

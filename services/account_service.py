@@ -50,12 +50,15 @@ class AccountService:
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
+        self._persist_lock = Lock()
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._image_cooldown_until: dict[str, float] = {}
+        self._image_consecutive_fails: dict[str, int] = {}
+        self._last_text_used_flush: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
         self._last_alert_counts = self._count_total_and_active_locked()
@@ -129,8 +132,92 @@ class AccountService:
         }
 
     def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
-        self._check_account_alert_locked()
+        self._persist_full()
+
+    def _persist_full(self) -> None:
+        """在独立持久化锁下执行全量保存，避免持有账号主锁阻塞请求调度。"""
+        with self._persist_lock:
+            with self._lock:
+                all_accounts = [dict(item) for item in self._accounts.values()]
+            self.storage.save_accounts(all_accounts)
+
+    def _persist_upsert_tokens(self, tokens: list[str]) -> None:
+        """按最新内存快照增量持久化指定账号；锁顺序固定为 _persist_lock -> _lock，防止旧快照覆盖新状态。"""
+        target_tokens = list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
+        if not target_tokens:
+            return
+        with self._persist_lock:
+            with self._lock:
+                resolved_tokens = list(dict.fromkeys(self._resolve_access_token_locked(token) for token in target_tokens))
+                if self.storage.supports_incremental_accounts:
+                    upsert_items = [dict(self._accounts[tk]) for tk in resolved_tokens if tk in self._accounts]
+                    missing_tokens = [tk for tk in resolved_tokens if tk not in self._accounts]
+                    all_accounts: list[dict[str, Any]] = []
+                else:
+                    upsert_items = []
+                    missing_tokens = []
+                    all_accounts = [dict(item) for item in self._accounts.values()]
+            if self.storage.supports_incremental_accounts:
+                if upsert_items:
+                    self.storage.upsert_accounts(upsert_items, all_accounts)
+                if missing_tokens:
+                    self.storage.delete_accounts_by_tokens(missing_tokens, all_accounts)
+            else:
+                self.storage.save_accounts(all_accounts)
+
+    def _persist_delete_tokens(self, tokens: list[str]) -> None:
+        """按最新内存快照增量删除指定账号，若并发重新导入则自动转为更新。"""
+        target_tokens = list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
+        if not target_tokens:
+            return
+        with self._persist_lock:
+            with self._lock:
+                if self.storage.supports_incremental_accounts:
+                    delete_tokens: list[str] = []
+                    upsert_items: list[dict[str, Any]] = []
+                    seen_upserts: set[str] = set()
+                    for raw_token in target_tokens:
+                        resolved = self._resolve_access_token_locked(raw_token)
+                        if resolved in self._accounts:
+                            if resolved not in seen_upserts:
+                                seen_upserts.add(resolved)
+                                upsert_items.append(dict(self._accounts[resolved]))
+                        else:
+                            delete_tokens.append(raw_token)
+                            if resolved and resolved != raw_token:
+                                delete_tokens.append(resolved)
+                    all_accounts: list[dict[str, Any]] = []
+                else:
+                    delete_tokens = []
+                    upsert_items = []
+                    all_accounts = [dict(item) for item in self._accounts.values()]
+            if self.storage.supports_incremental_accounts:
+                if delete_tokens:
+                    self.storage.delete_accounts_by_tokens(delete_tokens, all_accounts)
+                if upsert_items:
+                    self.storage.upsert_accounts(upsert_items, all_accounts)
+            else:
+                self.storage.save_accounts(all_accounts)
+
+    def _persist_token_rotation(self, old_token: str, new_token: str) -> None:
+        """在独立持久化锁下原子同步 access_token 轮换结果。"""
+        with self._persist_lock:
+            with self._lock:
+                latest_token = self._resolve_access_token_locked(new_token)
+                latest_account = dict(self._accounts[latest_token]) if latest_token in self._accounts else None
+                all_accounts = (
+                    []
+                    if self.storage.supports_incremental_accounts
+                    else [dict(item) for item in self._accounts.values()]
+                )
+            if self.storage.supports_incremental_accounts:
+                if latest_account is not None:
+                    self.storage.replace_account_token(old_token, latest_account, all_accounts)
+                else:
+                    cleanup_tokens = [tk for tk in {old_token, new_token, latest_token} if tk]
+                    self.storage.delete_accounts_by_tokens(cleanup_tokens, all_accounts)
+            else:
+                self.storage.save_accounts(all_accounts)
 
     def _count_total_and_active_locked(self) -> tuple[int, int]:
         total = len(self._accounts)
@@ -462,6 +549,7 @@ class AccountService:
 
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        persisted_token = ""
         with self._lock:
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
@@ -473,7 +561,9 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[resolved] = account
-                self._save_accounts()
+                persisted_token = resolved
+        if persisted_token:
+            self._persist_upsert_tokens([persisted_token])
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
@@ -589,10 +679,26 @@ class AccountService:
                         old_cooldown,
                         float(self._image_cooldown_until.get(new_token, 0.0)),
                     )
+                old_fails = int(self._image_consecutive_fails.pop(old_token, 0))
+                if old_fails:
+                    self._image_consecutive_fails[new_token] = max(
+                        old_fails,
+                        int(self._image_consecutive_fails.get(new_token, 0)),
+                    )
+                old_flush = self._last_text_used_flush.pop(old_token, 0.0)
+                if old_flush:
+                    self._last_text_used_flush[new_token] = max(
+                        old_flush,
+                        float(self._last_text_used_flush.get(new_token, 0.0)),
+                    )
             self._accounts[new_token] = account
-            self._save_accounts()
+            self._check_account_alert_locked()
             self._image_slot_condition.notify_all()
 
+        if rotated:
+            self._persist_token_rotation(old_token, new_token)
+        else:
+            self._persist_upsert_tokens([new_token])
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 已刷新 access_token",
@@ -1095,6 +1201,34 @@ class AccountService:
                and float(self._image_cooldown_until.get(token, 0.0)) <= now
         ]
 
+    def has_ready_image_account(
+            self,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+            required_upload_quota: int = 0,
+    ) -> bool:
+        """检查排除指定账号后，号池中是否仍有其他就绪的生图候选账号。"""
+        with self._lock:
+            resolved_excluded: set[str] = set()
+            for raw_token in excluded_tokens or ():
+                if not raw_token:
+                    continue
+                resolved_excluded.add(raw_token)
+                resolved_token = self._resolve_access_token_locked(raw_token)
+                if resolved_token:
+                    resolved_excluded.add(resolved_token)
+            return bool(
+                self._list_ready_candidate_tokens(
+                    excluded_tokens=resolved_excluded,
+                    plan_type=plan_type,
+                    source_type=source_type,
+                    plan_types=plan_types,
+                    required_upload_quota=required_upload_quota,
+                )
+            )
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -1130,15 +1264,22 @@ class AccountService:
                 )
                 if tokens:
                     if required_upload_quota > 0:
+                        # 先按近期连续失败次数升序，避免低上传额度的故障号因 best-fit 反复被选中
                         tokens.sort(
                             key=lambda tk: (
+                                int(self._image_consecutive_fails.get(tk, 0)),
                                 *self._upload_quota_sort_key(self._accounts.get(tk) or {}),
                                 int(self._image_inflight.get(tk, 0)),
                             )
                         )
                         access_token = tokens[0]
                     else:
-                        access_token = tokens[self._index % len(tokens)]
+                        # 优先轮询无连续失败记录的健康账号，仅在全部退化时回退探测
+                        healthy_tokens = [
+                            tk for tk in tokens if int(self._image_consecutive_fails.get(tk, 0)) == 0
+                        ]
+                        candidate_pool = healthy_tokens or tokens
+                        access_token = candidate_pool[self._index % len(candidate_pool)]
                         self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
@@ -1169,6 +1310,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: float | None = None,
             required_upload_quota: int = 0,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1177,6 +1319,15 @@ class AccountService:
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
+        if excluded_tokens:
+            with self._lock:
+                for raw_token in excluded_tokens:
+                    if not raw_token:
+                        continue
+                    attempted_tokens.add(raw_token)
+                    resolved_token = self._resolve_access_token_locked(raw_token)
+                    if resolved_token:
+                        attempted_tokens.add(resolved_token)
         for _attempt in range(max_attempts):
             if deadline is not None and time.monotonic() >= deadline:
                 raise RuntimeError("等待可用生图账号超时（已超出本次生图超时预算）")
@@ -1268,6 +1419,8 @@ class AccountService:
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
+        token_to_flush = ""
+        now_mono = time.monotonic()
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1279,7 +1432,13 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_accounts()
+            # last_used_at 内存立即生效，持久化按单号 60 秒节流以消除高频对话写库风暴
+            last_flush = float(self._last_text_used_flush.get(access_token, 0.0))
+            if now_mono - last_flush >= 60.0:
+                self._last_text_used_flush[access_token] = now_mono
+                token_to_flush = access_token
+        if token_to_flush:
+            self._persist_upsert_tokens([token_to_flush])
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1390,6 +1549,7 @@ class AccountService:
         if not deduped:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
 
+        changed_tokens: list[str] = []
         with self._lock:
             added = 0
             skipped = 0
@@ -1415,22 +1575,28 @@ class AccountService:
                 )
                 if account is not None:
                     self._accounts[access_token] = account
-            self._save_accounts()
+                    changed_tokens.append(access_token)
+            self._check_account_alert_locked()
             items = [dict(item) for item in self._accounts.values()]
-            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
-                            {"added": added, "skipped": skipped})
+        if changed_tokens:
+            self._persist_upsert_tokens(changed_tokens)
+        log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
+                        {"added": added, "skipped": skipped})
         return {"added": added, "skipped": skipped, "items": items}
 
     def delete_accounts(self, tokens: list[str]) -> dict:
         target_set = set(token for token in tokens if token)
         if not target_set:
             return {"removed": 0, "items": self.list_accounts()}
+        deleted_tokens: list[str] = []
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
                 self._image_cooldown_until.pop(token, None)
+                self._image_consecutive_fails.pop(token, None)
+                self._last_text_used_flush.pop(token, None)
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()
@@ -1441,15 +1607,30 @@ class AccountService:
                     self._index %= len(self._accounts)
                 else:
                     self._index = 0
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
+                deleted_tokens = list(target_set)
+                self._check_account_alert_locked()
             items = [dict(item) for item in self._accounts.values()]
+        if deleted_tokens:
+            self._persist_delete_tokens(deleted_tokens)
+            log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    def update_account(
+        self,
+        access_token: str,
+        updates: dict,
+        quiet: bool = False,
+        *,
+        log_only_status_change: bool = False,
+        persist: bool = True,
+    ) -> dict | None:
         if not access_token:
             return None
-        with self._lock:
+        removed_rate_limited = False
+        changed = False
+        status_changed = False
+        result_account: dict | None = None
+        with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -1459,16 +1640,42 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
-                return None
-            self._accounts[access_token] = account
-            self._save_accounts()
-            if not quiet:
-                log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                                {"token": anonymize_token(access_token), "status": account.get("status")})
-            return dict(account)
-        return None
+                self._image_inflight.pop(access_token, None)
+                self._image_cooldown_until.pop(access_token, None)
+                self._image_consecutive_fails.pop(access_token, None)
+                self._last_text_used_flush.pop(access_token, None)
+                self._check_account_alert_locked()
+                self._image_slot_condition.notify_all()
+                removed_rate_limited = True
+            else:
+                # 字段完全未变化时直接返回，避免无意义的写库与刷屏日志
+                if account == current:
+                    return dict(account)
+                changed = True
+                status_changed = current.get("status") != account.get("status")
+                if status_changed and account.get("status") == "正常":
+                    self._image_consecutive_fails.pop(access_token, None)
+                    self._image_cooldown_until.pop(access_token, None)
+                    self._image_slot_condition.notify_all()
+                self._accounts[access_token] = account
+                self._check_account_alert_locked()
+                result_account = dict(account)
+
+        if removed_rate_limited:
+            if persist:
+                self._persist_delete_tokens([access_token])
+            log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+            return None
+        if changed and result_account is not None:
+            if persist:
+                self._persist_upsert_tokens([access_token])
+            if not quiet and (not log_only_status_change or status_changed):
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "更新账号",
+                    {"token": anonymize_token(access_token), "status": result_account.get("status")},
+                )
+        return result_account
 
     def _record_refresh_success(self, access_token: str) -> None:
         with self._lock:
@@ -1507,6 +1714,8 @@ class AccountService:
         defer_invalid_removal: bool = True,
     ) -> bool:
         now = datetime.now(timezone.utc)
+        persisted_token = ""
+        should_defer = False
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1521,20 +1730,24 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
-                self._save_accounts()
-            if should_defer:
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    "暂缓标记异常账号",
-                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
-                )
-                return False
+                persisted_token = access_token
+        if persisted_token:
+            self._persist_upsert_tokens([persisted_token])
+        if should_defer:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "暂缓标记异常账号",
+                {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+            )
+            return False
         return True
 
     def consume_upload_quota(self, access_token: str, count: int) -> dict | None:
         """扣减账号文件上传额度；耗尽时自动标记为限流账号。"""
         if not access_token or count <= 0:
             return None
+        removed_rate_limited = False
+        result_account: dict | None = None
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1563,12 +1776,23 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
-                return None
-            self._accounts[access_token] = account
-            self._save_accounts()
-            return dict(account)
+                self._image_inflight.pop(access_token, None)
+                self._image_cooldown_until.pop(access_token, None)
+                self._image_consecutive_fails.pop(access_token, None)
+                self._last_text_used_flush.pop(access_token, None)
+                self._check_account_alert_locked()
+                removed_rate_limited = True
+            else:
+                self._accounts[access_token] = account
+                self._check_account_alert_locked()
+                result_account = dict(account)
+        if removed_rate_limited:
+            self._persist_delete_tokens([access_token])
+            log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+            return None
+        if result_account is not None:
+            self._persist_upsert_tokens([access_token])
+        return result_account
 
     def mark_upload_rate_limited(
         self,
@@ -1581,6 +1805,9 @@ class AccountService:
             return None
         hours = max(1, int(cooldown_hours if cooldown_hours is not None else self._UPLOAD_LIMIT_COOLDOWN_HOURS))
         until_iso = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+        removed_rate_limited = False
+        account_email = None
+        result_account: dict | None = None
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1601,28 +1828,40 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is None:
                 return None
+            account_email = account.get("email")
             if config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    "文件上传限流自动移除账号",
-                    {"token": anonymize_token(access_token), "email": account.get("email"), "reason": reason[:200]},
-                )
-                return None
-            self._accounts[access_token] = account
-            self._save_accounts()
+                self._image_inflight.pop(access_token, None)
+                self._image_cooldown_until.pop(access_token, None)
+                self._image_consecutive_fails.pop(access_token, None)
+                self._last_text_used_flush.pop(access_token, None)
+                self._check_account_alert_locked()
+                removed_rate_limited = True
+            else:
+                self._accounts[access_token] = account
+                self._check_account_alert_locked()
+                result_account = dict(account)
+        if removed_rate_limited:
+            self._persist_delete_tokens([access_token])
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "文件上传限流自动移除账号",
+                {"token": anonymize_token(access_token), "email": account_email, "reason": reason[:200]},
+            )
+            return None
+        if result_account is not None:
+            self._persist_upsert_tokens([access_token])
             log_service.add(
                 LOG_TYPE_ACCOUNT,
                 f"账号触发文件上传限流，静置 {hours} 小时",
                 {
                     "token": anonymize_token(access_token),
-                    "email": account.get("email"),
+                    "email": account_email,
                     "restore_at": until_iso,
                     "reason": reason[:200],
                 },
             )
-            return dict(account)
+        return result_account
 
     def mark_image_result(
         self,
@@ -1630,20 +1869,42 @@ class AccountService:
         success: bool,
         cooldown_secs: float = 0.0,
         upload_count: int = 0,
+        penalize: bool = True,
     ) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
-        if cooldown_secs > 0:
-            with self._image_slot_condition:
-                access_token = self._resolve_access_token_locked(access_token)
-                self._image_cooldown_until[access_token] = max(
-                    float(self._image_cooldown_until.get(access_token, 0.0)),
-                    time.monotonic() + float(cooldown_secs),
-                )
-                self._image_slot_condition.notify_all()
-        with self._lock:
+        removed_rate_limited = False
+        result_account: dict | None = None
+        with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
+            current_inflight = int(self._image_inflight.get(access_token, 0))
+            if current_inflight <= 1:
+                self._image_inflight.pop(access_token, None)
+            else:
+                self._image_inflight[access_token] = current_inflight - 1
+            if success:
+                self._image_consecutive_fails.pop(access_token, None)
+                if cooldown_secs > 0:
+                    self._image_cooldown_until[access_token] = max(
+                        float(self._image_cooldown_until.get(access_token, 0.0)),
+                        time.monotonic() + float(cooldown_secs),
+                    )
+            else:
+                # 连续失败触发指数退避冷却（最高 30 分钟），阻止坏号反复吸干重试机会
+                effective_cooldown = max(0.0, float(cooldown_secs or 0.0))
+                if penalize:
+                    consecutive_fails = int(self._image_consecutive_fails.get(access_token, 0)) + 1
+                    self._image_consecutive_fails[access_token] = consecutive_fails
+                    if effective_cooldown > 0:
+                        effective_cooldown = min(1800.0, effective_cooldown * (3 ** (consecutive_fails - 1)))
+                    elif consecutive_fails >= 2:
+                        effective_cooldown = min(1800.0, 60.0 * (3 ** (consecutive_fails - 2)))
+                if effective_cooldown > 0:
+                    self._image_cooldown_until[access_token] = max(
+                        float(self._image_cooldown_until.get(access_token, 0.0)),
+                        time.monotonic() + effective_cooldown,
+                    )
+            self._image_slot_condition.notify_all()
             current = self._accounts.get(access_token)
             if current is None:
                 return None
@@ -1683,19 +1944,31 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
-                return None
-            self._accounts[access_token] = account
-            self._save_accounts()
-            return dict(account)
-        return None
+                self._image_inflight.pop(access_token, None)
+                self._image_cooldown_until.pop(access_token, None)
+                self._image_consecutive_fails.pop(access_token, None)
+                self._last_text_used_flush.pop(access_token, None)
+                self._check_account_alert_locked()
+                removed_rate_limited = True
+            else:
+                self._accounts[access_token] = account
+                self._check_account_alert_locked()
+                result_account = dict(account)
+        if removed_rate_limited:
+            self._persist_delete_tokens([access_token])
+            log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+            return None
+        if result_account is not None:
+            self._persist_upsert_tokens([access_token])
+        return result_account
 
     def fetch_remote_info(
         self,
         access_token: str,
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
+        *,
+        persist: bool = True,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
@@ -1736,7 +2009,11 @@ class AccountService:
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
-        self._record_refresh_success(active_token)
+        # 将刷新成功后的错误清零字段合并进 result，避免先改内存导致无变更判定失真
+        result["invalid_count"] = 0
+        result["last_invalid_at"] = None
+        result["last_refresh_error"] = None
+        result["last_refresh_error_at"] = None
         existing = self.get_account(active_token)
         if existing and self._is_upload_cooldown_active(existing):
             until_iso = str(existing.get("upload_limited_until") or "")
@@ -1753,7 +2030,12 @@ class AccountService:
             )
         else:
             result["upload_limited_until"] = None
-        return self.update_account(active_token, result)
+        return self.update_account(
+            active_token,
+            result,
+            log_only_status_change=True,
+            persist=persist,
+        )
 
     # ---- 刷新进度追踪 ----
 
@@ -1876,6 +2158,9 @@ class AccountService:
         refreshed = 0
         errors = []
         max_workers = min(10, len(access_tokens))
+        # 文件/Git 存储不支持单行增量写，巡检批量刷新结束后统一落盘一次
+        defer_persist = not self.storage.supports_incremental_accounts
+        completed_any = False
 
         if progress_id:
             self.init_refresh_progress(progress_id, len(access_tokens))
@@ -1883,7 +2168,13 @@ class AccountService:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
+                executor.submit(
+                    self.fetch_remote_info,
+                    token,
+                    "refresh_accounts",
+                    defer_invalid_removal,
+                    persist=not defer_persist,
+                ): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
@@ -1900,6 +2191,7 @@ class AccountService:
                     if not is_tls_connection_error(error_str):
                         errors.append({"token": anonymize_token(token), "error": error_str})
                 else:
+                    completed_any = True
                     if account is not None:
                         refreshed += 1
 
@@ -1912,6 +2204,9 @@ class AccountService:
             raise
         else:
             executor.shutdown(wait=True, cancel_futures=True)
+
+        if defer_persist and completed_any:
+            self._persist_full()
 
         # 自动重新登录异常账号（仅当配置开启时）
         relogined = 0

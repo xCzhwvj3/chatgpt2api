@@ -179,7 +179,7 @@ class EditableFileExportResult:
 _SessionPoolKey = tuple[str, str, bool]
 _SESSION_POOL: dict[_SessionPoolKey, deque[tuple[float, requests.Session]]] = {}
 _SESSION_POOL_LOCK = threading.Lock()
-_SESSION_POOL_MAX_PER_KEY = 32
+_SESSION_POOL_MAX_PER_KEY = 128
 _SESSION_POOL_IDLE_TTL_SECS = 240.0
 
 

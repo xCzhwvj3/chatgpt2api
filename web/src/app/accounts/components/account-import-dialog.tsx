@@ -1,9 +1,10 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   ArrowLeft,
+  CheckCircle2,
   Copy,
   ExternalLink,
   FileJson,
@@ -14,6 +15,8 @@ import {
   LogIn,
   ServerCog,
   Upload,
+  X,
+  XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -30,15 +33,19 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import {
   createAccounts,
+  fetchAccounts,
+  fetchOAuthBatchImportJob,
   finishOAuthLogin,
+  startOAuthBatchImport,
   startOAuthLogin,
   type Account,
   type AccountImportPayload,
+  type OAuthBatchImportJob,
   type OAuthLoginStartResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth";
+type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth" | "oauth-batch";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
@@ -59,6 +66,14 @@ function splitTokens(value: string) {
     .split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function countCredentialLines(value: string) {
+  return value
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0 && !item.startsWith("#")).length;
 }
 
 function getSessionAccessToken(value: unknown) {
@@ -194,11 +209,31 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [oauthSession, setOauthSession] = useState<OAuthLoginStartResponse | null>(null);
   const [oauthCallbackInput, setOauthCallbackInput] = useState("");
   const [oauthStarting, setOauthStarting] = useState(false);
+  const [batchFile, setBatchFile] = useState<File | null>(null);
+  const [batchFileLineCount, setBatchFileLineCount] = useState(0);
+  const [batchTextInput, setBatchTextInput] = useState("");
+  const [batchJob, setBatchJob] = useState<OAuthBatchImportJob | null>(null);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const accountJsonInputRef = useRef<HTMLInputElement | null>(null);
+  const oauthBatchFileInputRef = useRef<HTMLInputElement | null>(null);
+  const batchPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const batchPollSeqRef = useRef(0);
+
+  const stopBatchPolling = () => {
+    batchPollSeqRef.current += 1;
+    if (batchPollTimerRef.current !== null) {
+      clearTimeout(batchPollTimerRef.current);
+      batchPollTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => stopBatchPolling();
+  }, []);
 
   const resetState = () => {
+    stopBatchPolling();
     setMethod("menu");
     setTokenInput("");
     setSessionInput("");
@@ -209,6 +244,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setOauthSession(null);
     setOauthCallbackInput("");
     setOauthStarting(false);
+    setBatchFile(null);
+    setBatchFileLineCount(0);
+    setBatchTextInput("");
+    setBatchJob(null);
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -253,6 +292,104 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const handleImportTokenText = async () => {
     await submitTokens(splitTokens(tokenInput), "Access Token 导入完成");
+  };
+
+  const handleOAuthBatchFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error("凭证文件不能超过 2MB");
+      return;
+    }
+    try {
+      const content = await readFileAsText(file);
+      const lineCount = countCredentialLines(content);
+      if (lineCount === 0) {
+        toast.error("文件中没有读取到非空凭证行");
+        return;
+      }
+      setBatchFile(file);
+      setBatchFileLineCount(lineCount);
+      toast.success(`已选择 ${file.name}（检测到 ${lineCount} 行记录）`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取凭证文件失败";
+      toast.error(message);
+    }
+  };
+
+  // 启动服务端批量 OAuth 登录任务并轮询进度，完成后刷新账号列表
+  const handleStartOAuthBatch = async () => {
+    if (!batchFile && !batchTextInput.trim()) {
+      toast.error("请先选择凭证文件或粘贴账号列表");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const job = await startOAuthBatchImport({
+        file: batchFile,
+        content: batchTextInput,
+      });
+      setBatchJob(job);
+      setBatchFile(null);
+      setBatchFileLineCount(0);
+      setBatchTextInput("");
+      toast.success(`已提交 ${job.total} 个账号，服务端正在逐个执行 OAuth 登录`);
+
+      stopBatchPolling();
+      const pollSeq = batchPollSeqRef.current;
+      const pollJob = async () => {
+        try {
+          const latest = await fetchOAuthBatchImportJob(job.job_id);
+          if (pollSeq !== batchPollSeqRef.current) {
+            return;
+          }
+          setBatchJob(latest);
+          if (latest.done) {
+            stopBatchPolling();
+            try {
+              const refreshedAccounts = await fetchAccounts();
+              onImported(refreshedAccounts.items);
+            } catch {
+              // 列表拉取失败不影响任务结果展示
+            }
+            if (latest.failed > 0 && latest.succeeded === 0) {
+              toast.error(`批量 OAuth 登录结束：共 ${latest.total} 个，全部失败`);
+            } else if (latest.failed > 0) {
+              toast.error(
+                `批量 OAuth 登录完成：成功 ${latest.succeeded} 个（新增 ${latest.added}），失败 ${latest.failed} 个`,
+              );
+            } else {
+              toast.success(
+                `批量 OAuth 登录完成：成功 ${latest.succeeded} 个，新增 ${latest.added} 个，已刷新账号信息`,
+              );
+            }
+            return;
+          }
+          batchPollTimerRef.current = setTimeout(() => {
+            void pollJob();
+          }, 1000);
+        } catch (pollError) {
+          if (pollSeq !== batchPollSeqRef.current) {
+            return;
+          }
+          stopBatchPolling();
+          const msg = pollError instanceof Error ? pollError.message : "获取批量登录进度失败";
+          toast.error(msg);
+        }
+      };
+      batchPollTimerRef.current = setTimeout(() => {
+        void pollJob();
+      }, 1000);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "提交批量 OAuth 登录失败";
+      toast.error(message);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // 起授权：拿 authorize URL，立刻在新窗口打开，方便用户登录
@@ -641,6 +778,222 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       );
     }
 
+    if (method === "oauth-batch") {
+      const textLineCount = countCredentialLines(batchTextInput);
+      const totalInputLines = batchFileLineCount + textLineCount;
+      const batchRunning = Boolean(batchJob && !batchJob.done);
+      const progressPercent =
+        batchJob && batchJob.total > 0
+          ? Math.min(100, Math.round((batchJob.processed / batchJob.total) * 100))
+          : 0;
+
+      return (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <button
+              type="button"
+              onClick={() => {
+                stopBatchPolling();
+                setBatchJob(null);
+                setMethod("menu");
+              }}
+              disabled={batchRunning}
+              className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800 disabled:opacity-50"
+            >
+              <ArrowLeft className="size-4" />
+              返回导入方式
+            </button>
+            {!batchJob ? (
+              <span className="text-xs text-stone-400">当前待提交约 {totalInputLines} 行</span>
+            ) : (
+              <span className="text-xs text-stone-500">
+                {batchJob.done ? "任务已结束" : "服务端顺序登录中..."}
+              </span>
+            )}
+          </div>
+
+          {!batchJob ? (
+            <>
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600 space-y-1">
+                <div className="font-medium text-stone-800">文件与格式说明</div>
+                <div>
+                  每行一条，格式为{" "}
+                  <code className="rounded bg-white px-1.5 py-0.5 font-mono text-xs text-stone-800">
+                    邮箱----密码----2FA密钥
+                  </code>
+                  （未开启 2FA 可仅填{" "}
+                  <code className="rounded bg-white px-1.5 py-0.5 font-mono text-xs text-stone-800">
+                    邮箱----密码
+                  </code>
+                  ，支持 <code className="font-mono text-xs">#</code> 注释行）。
+                </div>
+                <div className="text-xs text-stone-500">
+                  服务端按标准 OAuth 逐个换取 Access Token 与 Refresh Token 并自动刷新入库；密码和 2FA 密钥仅在本次登录内存使用，不写入账号库。
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium text-stone-800">上传凭证文件（TXT）</div>
+                    <div className="text-sm leading-6 text-stone-500">
+                      直接上传至远程服务器解析并执行批量 OAuth 登录（单文件上限 2MB）。
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="rounded-xl border-stone-200 bg-white"
+                    onClick={() => oauthBatchFileInputRef.current?.click()}
+                    disabled={isSubmitting}
+                  >
+                    <FileText className="size-4" />
+                    选择凭证文件
+                  </Button>
+                </div>
+                {batchFile ? (
+                  <div className="mt-3 flex items-center justify-between rounded-xl border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                    <div className="truncate">
+                      已选文件：<span className="font-medium text-stone-900">{batchFile.name}</span>（检测到 {batchFileLineCount} 行）
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBatchFile(null);
+                        setBatchFileLineCount(0);
+                      }}
+                      className="ml-2 rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+                      aria-label="移除文件"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+              <input
+                ref={oauthBatchFileInputRef}
+                type="file"
+                accept=".txt,.csv,text/plain"
+                className="hidden"
+                onChange={(event) => void handleOAuthBatchFileSelected(event)}
+              />
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">或直接粘贴账号列表（可选）</label>
+                <Textarea
+                  placeholder={"user1@example.com----YourPassword----JBSWY3DPEHPK3PXP\nuser2@example.com----YourPassword----JBSWY3DPEHPK3PXQ"}
+                  value={batchTextInput}
+                  onChange={(event) => setBatchTextInput(event.target.value)}
+                  className="min-h-36 resize-none rounded-xl border-stone-200 font-mono text-xs"
+                />
+              </div>
+            </>
+          ) : (
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <div className="flex items-center gap-2 font-medium text-stone-800">
+                    {batchRunning ? <LoaderCircle className="size-4 animate-spin text-amber-600" /> : null}
+                    <span>
+                      {batchRunning
+                        ? `正在登录：${batchJob.current_email || "准备中..."}`
+                        : batchJob.status === "completed"
+                          ? "批量 OAuth 登录已完成"
+                          : "批量 OAuth 登录结束（全部失败）"}
+                    </span>
+                  </div>
+                  <span className="font-mono text-xs text-stone-600">
+                    {batchJob.processed}/{batchJob.total} ({progressPercent}%)
+                  </span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-stone-200">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-amber-400 to-orange-500 transition-all duration-300"
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                </div>
+                <div className="grid grid-cols-4 gap-2 text-center text-xs">
+                  <div className="rounded-xl bg-white px-2 py-2 border border-stone-200">
+                    <div className="text-stone-400">成功</div>
+                    <div className="mt-0.5 font-semibold text-emerald-700">{batchJob.succeeded}</div>
+                  </div>
+                  <div className="rounded-xl bg-white px-2 py-2 border border-stone-200">
+                    <div className="text-stone-400">新增入库</div>
+                    <div className="mt-0.5 font-semibold text-stone-900">{batchJob.added}</div>
+                  </div>
+                  <div className="rounded-xl bg-white px-2 py-2 border border-stone-200">
+                    <div className="text-stone-400">已刷新</div>
+                    <div className="mt-0.5 font-semibold text-stone-900">{batchJob.refreshed}</div>
+                  </div>
+                  <div className="rounded-xl bg-white px-2 py-2 border border-stone-200">
+                    <div className="text-stone-400">失败</div>
+                    <div className="mt-0.5 font-semibold text-rose-600">{batchJob.failed}</div>
+                  </div>
+                </div>
+              </div>
+
+              {batchJob.parse_errors.length > 0 ? (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 space-y-1">
+                  <div className="font-medium">
+                    已忽略 {batchJob.parse_errors.length} 行格式异常/重复记录：
+                  </div>
+                  <div className="max-h-24 overflow-y-auto space-y-0.5 font-mono">
+                    {batchJob.parse_errors.map((err, idx) => (
+                      <div key={`${err.line}-${idx}`}>
+                        第 {err.line} 行{err.email ? ` (${err.email})` : ""}：{err.error}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="rounded-2xl border border-stone-200 bg-white">
+                <div className="border-b border-stone-100 px-3.5 py-2 text-xs font-medium text-stone-500">
+                  逐条执行结果（{batchJob.results.length}/{batchJob.total}）
+                </div>
+                <div className="max-h-56 divide-y divide-stone-100 overflow-y-auto">
+                  {batchJob.results.length === 0 ? (
+                    <div className="px-3.5 py-6 text-center text-xs text-stone-400">
+                      等待首个账号返回结果...
+                    </div>
+                  ) : (
+                    batchJob.results.map((item, idx) => (
+                      <div key={`${item.email}-${idx}`} className="flex items-start justify-between gap-3 px-3.5 py-2.5 text-xs">
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-mono text-stone-800">{item.email}</div>
+                          {item.error ? (
+                            <div className={cn("mt-0.5 break-all", item.ok ? "text-amber-700" : "text-rose-600")}>
+                              {item.error}
+                            </div>
+                          ) : (
+                            <div className="mt-0.5 text-stone-400">
+                              {item.added > 0 ? "已新增入库" : "已更新已有账号"}
+                              {item.refreshed > 0 ? " · 已刷新额度" : ""}
+                            </div>
+                          )}
+                        </div>
+                        {item.ok ? (
+                          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700">
+                            <CheckCircle2 className="size-3.5" />
+                            成功
+                          </span>
+                        ) : (
+                          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 font-medium text-rose-700">
+                            <XCircle className="size-3.5" />
+                            失败
+                          </span>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
     if (method === "account-json") {
       return (
         <div className="space-y-4">
@@ -721,6 +1074,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           onClick={() => setMethod("oauth")}
         />
         <MethodCard
+          title="批量 OAuth 登录导入（账号密码 + 2FA 文件）"
+          description="上传 TXT 凭证文件或粘贴「邮箱----密码----2FA密钥」，服务端逐个走 OAuth 登录换票并自动刷新入库。"
+          icon={Upload}
+          onClick={() => setMethod("oauth-batch")}
+        />
+        <MethodCard
           title="导入 Access Token"
           description="支持直接粘贴，一行一个；也支持从 TXT 文件读取，一行一个。"
           icon={KeyRound}
@@ -781,7 +1140,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           <Upload className="size-4" />
           导入
         </Button>
-        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+        <DialogContent showCloseButton={false} className="max-h-[90vh] overflow-y-auto rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>
               {method === "menu"
@@ -794,6 +1153,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                       ? "导入 Codex 认证 JSON"
                     : method === "oauth"
                       ? "OAuth 登录已有账号"
+                    : method === "oauth-batch"
+                      ? "批量 OAuth 登录导入"
                       : "导入账号 JSON"}
             </DialogTitle>
             <DialogDescription className="text-sm leading-6">
@@ -807,6 +1168,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                       ? "粘贴 Codex 认证 JSON，系统会按 codex 来源导入。"
                     : method === "oauth"
                       ? "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
+                    : method === "oauth-batch"
+                      ? "上传凭证文件或粘贴账号列表，服务端按标准 OAuth 逐个登录并刷新入库。"
                       : "支持读取本项目导出的单账号对象或全部账号数组，并在提交前做数量确认。"}
             </DialogDescription>
           </DialogHeader>
@@ -817,10 +1180,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             <Button
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
-              onClick={() => setOpen(false)}
+              onClick={() => handleOpenChange(false)}
               disabled={footerDisabled}
             >
-              取消
+              {method === "oauth-batch" && batchJob ? (batchJob.done ? "关闭" : "后台继续并关闭") : "取消"}
             </Button>
             {method === "token" ? (
               <Button
@@ -863,6 +1226,27 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
               >
                 {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
                 完成导入
+              </Button>
+            ) : null}
+            {method === "oauth-batch" && !batchJob ? (
+              <Button
+                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                onClick={() => void handleStartOAuthBatch()}
+                disabled={footerDisabled || (!batchFile && !batchTextInput.trim())}
+              >
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                开始批量 OAuth 登录
+              </Button>
+            ) : null}
+            {method === "oauth-batch" && batchJob?.done ? (
+              <Button
+                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                onClick={() => {
+                  stopBatchPolling();
+                  setBatchJob(null);
+                }}
+              >
+                继续导入新一批
               </Button>
             ) : null}
             {method === "account-json" ? (

@@ -9,10 +9,11 @@ import zipfile
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from services.auth_service import auth_service
 
@@ -25,7 +26,11 @@ from api.support import (
 )
 from services.account_service import account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
-from services.oauth_login_service import OAuthLoginError, oauth_login_service
+from services.oauth_login_service import (
+    OAuthLoginError,
+    oauth_login_service,
+    parse_credentials_text,
+)
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
@@ -119,6 +124,9 @@ class OAuthLoginFinishRequest(BaseModel):
     """提交 callback。callback 既可以是完整 URL 也可以只填 code。"""
     session_id: str = ""
     callback: str = ""
+
+
+_MAX_OAUTH_BATCH_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _account_payload_token(item: dict[str, Any]) -> str:
@@ -393,6 +401,76 @@ def create_router() -> APIRouter:
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", add_result.get("items", [])),
         }
+
+    @router.post("/api/accounts/oauth/batch-import")
+    async def start_oauth_batch_import(
+            request: Request,
+            authorization: str | None = Header(default=None),
+    ):
+        """接收凭证文件上传或文本粘贴（邮箱----密码----2FA密钥），启动后台批量 OAuth 登录任务。"""
+        require_admin(authorization)
+        content_type = (request.headers.get("content-type") or "").lower()
+        text_chunks: list[str] = []
+
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            uploaded = form.get("file")
+            if isinstance(uploaded, StarletteUploadFile):
+                raw_bytes = await uploaded.read(_MAX_OAUTH_BATCH_FILE_BYTES + 1)
+                if len(raw_bytes) > _MAX_OAUTH_BATCH_FILE_BYTES:
+                    raise HTTPException(status_code=400, detail={"error": "上传文件不能超过 2MB"})
+                try:
+                    text_chunks.append(raw_bytes.decode("utf-8-sig"))
+                except UnicodeDecodeError as exc:
+                    raise HTTPException(status_code=400, detail={"error": "凭证文件必须为 UTF-8 文本格式"}) from exc
+            raw_content = form.get("content")
+            if isinstance(raw_content, str) and raw_content.strip():
+                text_chunks.append(raw_content)
+        else:
+            try:
+                body = await request.json()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail={"error": "请求体需为 JSON 或 multipart/form-data"}) from exc
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail={"error": "无效的请求体格式"})
+            raw_content = str(body.get("content") or "")
+            if len(raw_content.encode("utf-8")) > _MAX_OAUTH_BATCH_FILE_BYTES:
+                raise HTTPException(status_code=400, detail={"error": "提交内容不能超过 2MB"})
+            if raw_content.strip():
+                text_chunks.append(raw_content)
+
+        merged_text = "\n".join(text_chunks).strip()
+        if not merged_text:
+            raise HTTPException(status_code=400, detail={"error": "请上传凭证文件或填写账号列表"})
+
+        credentials, parse_errors = parse_credentials_text(merged_text)
+        if not credentials:
+            first_err = parse_errors[0]["error"] if parse_errors else "格式无效"
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"未解析到有效账号（共 {len(parse_errors)} 行格式异常，例如：{first_err}）"},
+            )
+
+        try:
+            return await run_in_threadpool(
+                oauth_login_service.start_batch_import,
+                credentials,
+                parse_errors,
+            )
+        except OAuthLoginError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/accounts/oauth/batch-import/{job_id}")
+    def get_oauth_batch_import_job(
+            job_id: str,
+            authorization: str | None = Header(default=None),
+    ):
+        """查询批量 OAuth 登录任务进度与逐条结果。"""
+        require_admin(authorization)
+        job = oauth_login_service.get_batch_import_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail={"error": "batch import job not found"})
+        return job
 
     @router.get("/api/cpa/pools")
     def list_cpa_pools(authorization: str | None = Header(default=None)):

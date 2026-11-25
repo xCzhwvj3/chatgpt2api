@@ -366,6 +366,62 @@ export async function finishOAuthLogin(sessionId: string, callback: string) {
   });
 }
 
+export type OAuthBatchImportParseError = {
+  line: number;
+  email: string;
+  error: string;
+};
+
+export type OAuthBatchImportItemResult = {
+  email: string;
+  ok: boolean;
+  added: number;
+  skipped: number;
+  refreshed: number;
+  error: string;
+};
+
+export type OAuthBatchImportJob = {
+  job_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  total: number;
+  processed: number;
+  succeeded: number;
+  added: number;
+  skipped: number;
+  refreshed: number;
+  failed: number;
+  current_email: string;
+  parse_errors: OAuthBatchImportParseError[];
+  results: OAuthBatchImportItemResult[];
+  done: boolean;
+  error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export async function startOAuthBatchImport(payload: { file?: File | null; content?: string }) {
+  if (payload.file) {
+    const formData = new FormData();
+    formData.append("file", payload.file);
+    if (payload.content?.trim()) {
+      formData.append("content", payload.content);
+    }
+    return httpRequest<OAuthBatchImportJob>("/api/accounts/oauth/batch-import", {
+      method: "POST",
+      body: formData,
+    });
+  }
+  return httpRequest<OAuthBatchImportJob>("/api/accounts/oauth/batch-import", {
+    method: "POST",
+    body: { content: payload.content ?? "" },
+  });
+}
+
+export async function fetchOAuthBatchImportJob(jobId: string) {
+  return httpRequest<OAuthBatchImportJob>(`/api/accounts/oauth/batch-import/${jobId}`);
+}
+
 export async function deleteAccounts(tokens: string[]) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "DELETE",

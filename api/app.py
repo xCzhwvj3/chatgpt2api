@@ -24,8 +24,8 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         # 调大默认 AnyIO 线程池上限，避免长耗时流式/生图请求占满默认 40 线程饿死其他接口
-        raw_tokens = str(os.getenv("CHATGPT2API_THREADPOOL_TOKENS", "200") or "200").strip()
-        target_tokens = int(raw_tokens) if raw_tokens.isdigit() else 200
+        raw_tokens = str(os.getenv("CHATGPT2API_THREADPOOL_TOKENS", "300") or "300").strip()
+        target_tokens = int(raw_tokens) if raw_tokens.isdigit() else 300
         to_thread.current_default_thread_limiter().total_tokens = max(40, target_tokens)
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)

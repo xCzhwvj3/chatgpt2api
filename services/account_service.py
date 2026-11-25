@@ -51,7 +51,7 @@ class AccountService:
         self.storage = storage_backend
         self._lock = Lock()
         self._persist_lock = Lock()
-        self._token_refresh_lock = Lock()
+        self._token_refresh_locks: dict[str, Lock] = {}
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
@@ -691,6 +691,9 @@ class AccountService:
                         old_flush,
                         float(self._last_text_used_flush.get(new_token, 0.0)),
                     )
+                old_refresh_lock = self._token_refresh_locks.pop(old_token, None)
+                if old_refresh_lock is not None:
+                    self._token_refresh_locks.setdefault(new_token, old_refresh_lock)
             self._accounts[new_token] = account
             self._check_account_alert_locked()
             self._image_slot_condition.notify_all()
@@ -707,25 +710,42 @@ class AccountService:
         return new_token
 
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
+        """按账号粒度刷新即将过期或强制刷新的 access_token，未过期时走无刷新锁快路径直接返回。"""
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        with self._lock:
+            initial_token = self._resolve_access_token_locked(access_token)
+            initial_account = self._accounts.get(initial_token)
+            if not initial_account:
+                return access_token
+            active_token = str(initial_account.get("access_token") or initial_token or access_token)
+            if not self._token_needs_refresh(active_token, force=force):
+                return active_token
+            if not str(initial_account.get("refresh_token") or "").strip():
+                return active_token
+            if not force and self._recent_token_refresh_error(initial_account):
+                return active_token
+            account_lock = self._token_refresh_locks.setdefault(active_token, Lock())
+
+        with account_lock:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
-            active_token = str(account.get("access_token") or resolved_token or access_token)
-            if not self._token_needs_refresh(active_token, force=force):
-                return active_token
+            current_token = str(account.get("access_token") or resolved_token or access_token)
+            if current_token != active_token:
+                return current_token
+            if not self._token_needs_refresh(current_token, force=force):
+                return current_token
             refresh_token = str(account.get("refresh_token") or "").strip()
             if not refresh_token:
-                return active_token
+                return current_token
             if not force and self._recent_token_refresh_error(account):
-                return active_token
+                return current_token
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
                 error_str = str(exc or "")
-                self._record_token_refresh_error(active_token, event, error_str)
+                self._record_token_refresh_error(current_token, event, error_str)
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
                 if "app_session_terminated" in error_str.lower():
                     # 获取账号信息（email, password）
@@ -733,14 +753,14 @@ class AccountService:
                     password = str(account.get("password") or "").strip()
                     if email and password:
                         # 创建新线程执行密码重新登录
-                        t = Thread(
+                        relogin_thread = Thread(
                             target=self._password_re_login_thread,
-                            args=(active_token, email, password, event),
+                            args=(current_token, email, password, event),
                             daemon=True,
                         )
-                        t.start()
-                return active_token
-            return self._apply_refreshed_tokens(active_token, token_data, event)
+                        relogin_thread.start()
+                return current_token
+            return self._apply_refreshed_tokens(current_token, token_data, event)
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -1597,6 +1617,7 @@ class AccountService:
                 self._image_cooldown_until.pop(token, None)
                 self._image_consecutive_fails.pop(token, None)
                 self._last_text_used_flush.pop(token, None)
+                self._token_refresh_locks.pop(token, None)
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()
@@ -1644,6 +1665,7 @@ class AccountService:
                 self._image_cooldown_until.pop(access_token, None)
                 self._image_consecutive_fails.pop(access_token, None)
                 self._last_text_used_flush.pop(access_token, None)
+                self._token_refresh_locks.pop(access_token, None)
                 self._check_account_alert_locked()
                 self._image_slot_condition.notify_all()
                 removed_rate_limited = True
@@ -1780,6 +1802,7 @@ class AccountService:
                 self._image_cooldown_until.pop(access_token, None)
                 self._image_consecutive_fails.pop(access_token, None)
                 self._last_text_used_flush.pop(access_token, None)
+                self._token_refresh_locks.pop(access_token, None)
                 self._check_account_alert_locked()
                 removed_rate_limited = True
             else:
@@ -1835,6 +1858,7 @@ class AccountService:
                 self._image_cooldown_until.pop(access_token, None)
                 self._image_consecutive_fails.pop(access_token, None)
                 self._last_text_used_flush.pop(access_token, None)
+                self._token_refresh_locks.pop(access_token, None)
                 self._check_account_alert_locked()
                 removed_rate_limited = True
             else:
@@ -1948,6 +1972,7 @@ class AccountService:
                 self._image_cooldown_until.pop(access_token, None)
                 self._image_consecutive_fails.pop(access_token, None)
                 self._last_text_used_flush.pop(access_token, None)
+                self._token_refresh_locks.pop(access_token, None)
                 self._check_account_alert_locked()
                 removed_rate_limited = True
             else:

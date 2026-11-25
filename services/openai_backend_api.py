@@ -476,12 +476,16 @@ class OpenAIBackendAPI:
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
-        self._closed = True
         session = getattr(self, "session", None)
-        self.session = None
         if session:
             try:
                 self._closed_headers = dict(session.headers)
+            except Exception:
+                pass
+        self._closed = True
+        self.session = None
+        if session:
+            try:
                 if _checkin_session is not None:
                     _checkin_session(getattr(self, "_session_pool_key", None), session)
             except Exception:
@@ -528,11 +532,14 @@ class OpenAIBackendAPI:
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
+        session = getattr(self, "session", None)
         headers = (
-            dict(self.session.headers)
-            if getattr(self, "session", None) is not None
+            dict(session.headers)
+            if session is not None and not getattr(self, "_closed", False)
             else dict(getattr(self, "_closed_headers", ()))
         )
+        if not headers:
+            headers = dict(getattr(self, "_closed_headers", ()))
         headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
         account = getattr(self, "account", None)
@@ -1397,12 +1404,26 @@ class OpenAIBackendAPI:
             "Referer": f"{self.base_url}/c/{conversation_id}",
             "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}",
         })
-        response = self.session.patch(
-            self.base_url + path,
-            headers=headers,
-            json={"is_visible": False},
-            timeout=60,
-        )
+        session = getattr(self, "session", None)
+        if hasattr(self, "_session_kwargs") and (session is None or isinstance(session, _PooledSession)):
+            # 后台删会话线程独立借还连接，避免主线程 close() 归还连接池后与其他并发请求争用同一 libcurl 句柄
+            pool_key, worker_session = _checkout_session(self._session_kwargs, getattr(self, "_reset_status_codes", (403,)))
+            try:
+                response = worker_session.patch(
+                    self.base_url + path,
+                    headers=headers,
+                    json={"is_visible": False},
+                    timeout=60,
+                )
+            finally:
+                _checkin_session(pool_key, worker_session)
+        else:
+            response = session.patch(
+                self.base_url + path,
+                headers=headers,
+                json={"is_visible": False},
+                timeout=60,
+            )
         ensure_ok(response, path)
         return response.json()
 
